@@ -20,6 +20,7 @@
 //! - Correct cleanup on connection drop via async drop/RAII
 
 use std::{
+    collections::VecDeque,
     net::SocketAddr,
     path::PathBuf,
     sync::Arc,
