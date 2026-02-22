@@ -87,10 +87,37 @@ fn build_client_config(accept_insecure: bool, keep_alive_ms: u64) -> Result<Clie
     let mut config = ClientConfig::new(Arc::new(qc));
 
     let mut transport = quinn::TransportConfig::default();
-    transport.max_idle_timeout(Some(Duration::from_secs(120).try_into().unwrap()));
+
+    // ── Idle / keepalive ──────────────────────────────────────────────────────
+    transport.max_idle_timeout(Some(Duration::from_secs(300).try_into().unwrap()));
     if keep_alive_ms > 0 {
         transport.keep_alive_interval(Some(Duration::from_millis(keep_alive_ms)));
     }
+
+    // ── Congestion control ───────────────────────────────────────────────────
+    // BBR probes for bandwidth and RTT rather than reacting to loss signals.
+    // DNS tunnels see a lot of "loss" that is actually NXDOMAIN responses
+    // or resolver deduplication — BBR handles this far better than NewReno.
+    transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+
+    // ── Window sizes ─────────────────────────────────────────────────────────
+    transport.send_window(8 * 1024 * 1024);                               // 8 MB
+    transport.receive_window(quinn::VarInt::from_u32(8 * 1024 * 1024));   // 8 MB
+    transport.stream_receive_window(quinn::VarInt::from_u32(4 * 1024 * 1024)); // 4 MB per stream
+
+    // ── MTU discovery ────────────────────────────────────────────────────────
+    // DNS path MTU is fixed by our encoding (~512 bytes per query).
+    // PMTUD probes will always appear to fail — disable them.
+    transport.mtu_discovery_config(None);
+
+    // ── Multiplexing ─────────────────────────────────────────────────────────
+    transport.max_concurrent_bidi_streams(quinn::VarInt::from_u32(256));
+
+    // ── Initial RTT estimate ──────────────────────────────────────────────────
+    // Start with a realistic guess for DNS tunnel latency (resolver + auth server).
+    // This avoids QUIC being overly conservative in the first few seconds.
+    transport.initial_rtt(Duration::from_millis(400));
+
     config.transport_config(Arc::new(transport));
 
     Ok(config)
@@ -225,9 +252,10 @@ async fn run_keepalive(
     domain: String,
     mut shutdown: tokio::sync::broadcast::Receiver<()>,
 ) {
-    // Send a keepalive every 50ms. At 200ms RTT this gives the server ~4 queued
-    // slots at any moment, enough for typical QUIC handshake traffic.
-    let mut tick = interval(Duration::from_millis(50));
+    // Send a keepalive every 20ms (50/sec). At 400ms DNS RTT this maintains
+    // ~20 outstanding query slots at any moment — enough to sustain throughput
+    // without hitting resolver rate limits.
+    let mut tick = interval(Duration::from_millis(20));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {

@@ -122,9 +122,40 @@ fn build_server_config(
     let mut config = ServerConfig::with_crypto(Arc::new(qc));
 
     let mut transport = quinn::TransportConfig::default();
+
+    // ── Idle / keepalive ──────────────────────────────────────────────────────
     transport.max_idle_timeout(Some(Duration::from_secs(300).try_into()?));
     transport.keep_alive_interval(Some(Duration::from_millis(400)));
-    // On server side: allow large initial congestion window
+
+    // ── Congestion control ───────────────────────────────────────────────────
+    // Use BBR instead of NewReno (default). BBR measures bandwidth and RTT
+    // directly rather than reacting to loss, making it much more aggressive
+    // on high-latency links (exactly what DNS tunnels are).
+    // The C code goes further and sets cwin=UINT64_MAX (no CC at all on server),
+    // but quinn doesn't expose that. BBR is the next best option.
+    transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+
+    // ── Window sizes ─────────────────────────────────────────────────────────
+    // Large windows let QUIC keep many packets in flight simultaneously,
+    // which is essential for high-throughput over high-latency DNS links.
+    transport.send_window(16 * 1024 * 1024);                              // 16 MB
+    transport.receive_window(quinn::VarInt::from_u32(8 * 1024 * 1024));   // 8 MB
+    transport.stream_receive_window(quinn::VarInt::from_u32(4 * 1024 * 1024)); // 4 MB per stream
+
+    // ── MTU discovery ────────────────────────────────────────────────────────
+    // We know our effective path MTU (bounded by DNS query size ~512 bytes),
+    // so PMTUD probes would always fail and waste bandwidth. Disable it.
+    transport.mtu_discovery_config(None);
+
+    // ── Multiplexing limits ──────────────────────────────────────────────────
+    // Allow many concurrent bidi streams (one per proxied TCP connection).
+    transport.max_concurrent_bidi_streams(quinn::VarInt::from_u32(256));
+
+    // ── Initial RTT estimate ──────────────────────────────────────────────────
+    // DNS tunnel RTTs are typically 200-600ms. A good initial estimate
+    // prevents QUIC from being overly conservative at connection start.
+    transport.initial_rtt(Duration::from_millis(400));
+
     config.transport_config(Arc::new(transport));
 
     Ok(config)
