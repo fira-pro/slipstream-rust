@@ -22,3 +22,4 @@ data-encoding = { workspace = true }
 bytes = { workspace = true }
 futures = { workspace = true }
 rand = { workspace = true }
+socket2 = { workspace = true }

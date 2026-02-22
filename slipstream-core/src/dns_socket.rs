@@ -16,7 +16,7 @@
 use std::{
     collections::VecDeque,
     io,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{IpAddr, SocketAddr},
     sync::{Arc, Mutex},
 };
 

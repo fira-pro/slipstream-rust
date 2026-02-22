@@ -36,6 +36,7 @@ use slipstream_core::{
     config::{ALPN_PROTOCOL, SERVER_SNI},
 };
 use tokio::{
+    io::AsyncWriteExt,
     net::{TcpStream, UdpSocket},
     select,
     sync::Mutex,
@@ -153,7 +154,7 @@ async fn make_loopback_pair() -> Result<(std::net::UdpSocket, UdpSocket)> {
 
 /// For each DNS query we receive, remember where to send the response.
 #[derive(Debug, Clone)]
-struct Pending {
+struct DnsQueryPending {
     /// Original UDP sender of the DNS query (the DNS resolver or client).
     client_addr: SocketAddr,
     /// Raw wire bytes of the DNS query (to reconstruct response).
@@ -179,7 +180,7 @@ async fn run_bridge(
     dns_sock: Arc<UdpSocket>,
     bridge_sock: Arc<UdpSocket>,
     domain: String,
-    pending_queue: Arc<Mutex<VecDeque<Pending>>>,
+    pending_queue: Arc<Mutex<VecDeque<DnsQueryPending>>>,
     mut shutdown: tokio::sync::broadcast::Receiver<()>,
 ) {
     let mut dns_buf = vec![0u8; 4096];
@@ -215,7 +216,7 @@ async fn run_bridge(
                                 // Remember this query
                                 {
                                     let mut pq = pending_queue.lock().await;
-                                    pq.push_back(Pending {
+                                    pq.push_back(DnsQueryPending {
                                         client_addr,
                                         query_wire: wire.to_vec(),
                                     });
@@ -399,7 +400,7 @@ async fn main() -> Result<()> {
     info!("QUIC endpoint ready");
 
     // Pending query queue (shared between bridge task and nothing else for now)
-    let pending_queue: Arc<Mutex<VecDeque<Pending>>> = Arc::new(Mutex::new(VecDeque::new()));
+    let pending_queue: Arc<Mutex<VecDeque<DnsQueryPending>>> = Arc::new(Mutex::new(VecDeque::new()));
 
     // Shutdown broadcast
     let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(4);
