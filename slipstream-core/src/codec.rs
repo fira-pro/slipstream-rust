@@ -68,23 +68,69 @@ fn write_u32(buf: &mut Vec<u8>, v: u32) {
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
-/// Encode `quic_data` as a DNS TXT query targeting `<b32-subdomain>.<domain>`.
+/// Size of the fragmentation header prepended before base32 encoding.
+/// Layout: [frag_id_hi, frag_id_lo, seq_num, total_frags]
+pub const FRAG_HEADER_LEN: usize = 4;
+
+/// Maximum QUIC payload bytes that fit in one DNS query QNAME for the given domain.
+pub fn max_quic_chunk_size(domain: &str) -> usize {
+    // Available text chars for subdomain: 253 (max QNAME) - domain.len() - 1 (separator dot)
+    let available = 253usize.saturating_sub(domain.len() + 1);
+    // dotify adds 1 dot per 63 base32 chars, so: b32_chars + b32_chars/63 <= available
+    // => b32_chars <= available * 63 / 64
+    let b32_chars = available * 63 / 64;
+    // 8 base32 chars encode 5 bytes
+    let raw_bytes = b32_chars * 5 / 8;
+    raw_bytes.saturating_sub(FRAG_HEADER_LEN).max(1)
+}
+
+/// Encode a QUIC packet (any size) into one or more DNS TXT query wire blobs.
 ///
-/// Returns the raw DNS wire-format query bytes.
-/// `quic_data` must be ≤ `Config::client_mtu` bytes (the caller is responsible).
+/// Each fragment carries a 4-byte header [frag_id:2][seq:1][total:1] prepended to
+/// the chunk, then the whole thing is base32-encoded into the QNAME.
+pub fn encode_dns_queries(quic_data: &[u8], domain: &str) -> Result<Vec<Vec<u8>>> {
+    let chunk_size = max_quic_chunk_size(domain);
+    let chunks: Vec<&[u8]> = quic_data.chunks(chunk_size).collect();
+    let total = chunks.len();
+    anyhow::ensure!(total <= 255, "packet requires {} fragments (max 255)", total);
+
+    let frag_id: u16 = rand::thread_rng().gen();
+    let mut out = Vec::with_capacity(total);
+
+    for (seq, chunk) in chunks.iter().enumerate() {
+        let mut payload = Vec::with_capacity(FRAG_HEADER_LEN + chunk.len());
+        payload.extend_from_slice(&frag_id.to_be_bytes());
+        payload.push(seq as u8);
+        payload.push(total as u8);
+        payload.extend_from_slice(chunk);
+        out.push(encode_dns_query(&payload, domain)?);
+    }
+
+    Ok(out)
+}
+
+/// Decode a fragmented DNS TXT query. Returns (frag_id, seq, total, quic_chunk).
+pub fn decode_dns_query_frag(wire: &[u8], domain: &str) -> Result<(u16, u8, u8, Vec<u8>)> {
+    let (_dns_id, payload) = decode_dns_query(wire, domain)?;
+    anyhow::ensure!(
+        payload.len() >= FRAG_HEADER_LEN,
+        "frag payload too short ({} bytes)",
+        payload.len()
+    );
+    let frag_id = u16::from_be_bytes([payload[0], payload[1]]);
+    let seq = payload[2];
+    let total = payload[3];
+    Ok((frag_id, seq, total, payload[FRAG_HEADER_LEN..].to_vec()))
+}
+
+/// Encode `quic_data` as a DNS TXT query targeting `<b32-subdomain>.<domain>`.
+/// The caller must ensure `quic_data` (including any header) fits in one QNAME.
 pub fn encode_dns_query(quic_data: &[u8], domain: &str) -> Result<Vec<u8>> {
-    // Base32-encode (no padding, uppercase)
     let encoded = BASE32_NOPAD.encode(quic_data);
-
-    // Add dots every 63 chars to form valid labels
     let dotted = dotify(&encoded);
-
-    // Full QNAME: <dotted-b32>.<domain>
     let qname = format!("{}.{}.", dotted, domain);
 
-    // Sanity check: QNAME must be ≤ 253 chars (DNS limit)
     if qname.len() > 253 + 1 {
-        // +1 for trailing dot
         bail!(
             "encode_dns_query: QNAME too long ({} bytes): '{}'",
             qname.len(),
@@ -95,33 +141,28 @@ pub fn encode_dns_query(quic_data: &[u8], domain: &str) -> Result<Vec<u8>> {
     let id: u16 = rand::thread_rng().gen();
     let mut buf: Vec<u8> = Vec::with_capacity(512);
 
-    // DNS header (12 bytes)
-    write_u16(&mut buf, id); // ID
-    write_u16(&mut buf, 0x0100u16); // Flags: QR=0, Opcode=0, RD=1
+    write_u16(&mut buf, id);
+    write_u16(&mut buf, 0x0100u16); // RD=1
     write_u16(&mut buf, 1); // QDCOUNT
     write_u16(&mut buf, 0); // ANCOUNT
     write_u16(&mut buf, 0); // NSCOUNT
-    write_u16(&mut buf, 1); // ARCOUNT (EDNS0 OPT)
+    write_u16(&mut buf, 1); // ARCOUNT (EDNS0)
 
-    // Question section
     write_name(&mut buf, &qname);
-    write_u16(&mut buf, DNS_TYPE_TXT); // QTYPE
-    write_u16(&mut buf, DNS_CLASS_IN); // QCLASS
+    write_u16(&mut buf, DNS_TYPE_TXT);
+    write_u16(&mut buf, DNS_CLASS_IN);
 
-    // Additional: EDNS0 OPT pseudo-RR
-    buf.push(0); // empty name (root)
-    write_u16(&mut buf, DNS_TYPE_OPT); // TYPE = OPT (41)
-    write_u16(&mut buf, 1232); // CLASS = requestor's UDP payload size
-    write_u32(&mut buf, 0); // TTL = extended RCODE (0) + version (0) + flags (0)
-    write_u16(&mut buf, 0); // RDLENGTH = 0 (no options)
+    // EDNS0 OPT RR
+    buf.push(0);
+    write_u16(&mut buf, DNS_TYPE_OPT);
+    write_u16(&mut buf, 4096); // increased payload size for larger responses
+    write_u32(&mut buf, 0);
+    write_u16(&mut buf, 0);
 
     Ok(buf)
 }
 
-/// Decode a DNS TXT query, extracting the base32-encoded QUIC payload from QNAME.
-///
-/// Returns `(query_id, quic_bytes)` so the server can match the response.
-/// The `domain` suffix is stripped from the QNAME before decoding.
+/// Decode a DNS TXT query QNAME → raw bytes (including any fragmentation header).
 pub fn decode_dns_query(wire: &[u8], domain: &str) -> Result<(u16, Vec<u8>)> {
     if wire.len() < 12 {
         bail!("decode_dns_query: packet too short ({} bytes)", wire.len());
@@ -129,8 +170,6 @@ pub fn decode_dns_query(wire: &[u8], domain: &str) -> Result<(u16, Vec<u8>)> {
 
     let id = u16::from_be_bytes([wire[0], wire[1]]);
     let flags = u16::from_be_bytes([wire[2], wire[3]]);
-
-    // QR bit must be 0 (query)
     if flags & 0x8000 != 0 {
         bail!("decode_dns_query: packet is a response, not a query");
     }
@@ -140,10 +179,8 @@ pub fn decode_dns_query(wire: &[u8], domain: &str) -> Result<(u16, Vec<u8>)> {
         bail!("decode_dns_query: expected 1 question, got {}", qdcount);
     }
 
-    // Parse QNAME starting at offset 12
     let (qname, after_qname) = parse_name(wire, 12)?;
 
-    // Check QTYPE == TXT
     if after_qname + 4 > wire.len() {
         bail!("decode_dns_query: truncated question section");
     }
@@ -152,30 +189,22 @@ pub fn decode_dns_query(wire: &[u8], domain: &str) -> Result<(u16, Vec<u8>)> {
         bail!("decode_dns_query: QTYPE is {} (expected TXT=16)", qtype);
     }
 
-    // Extract subdomain part: strip ".<domain>." suffix
     let suffix = format!(".{}.", domain);
-    let suffix_upper = suffix.to_ascii_uppercase();
     let qname_upper = qname.to_ascii_uppercase();
+    let suffix_upper = suffix.to_ascii_uppercase();
 
     let subdomain = if qname_upper.ends_with(&suffix_upper) {
         &qname[..qname.len() - suffix.len()]
-    } else if qname_upper.ends_with(&format!(".{}",domain.to_ascii_uppercase())) {
+    } else if qname_upper.ends_with(&format!(".{}", domain.to_ascii_uppercase())) {
         &qname[..qname.len() - domain.len() - 1]
     } else {
-        bail!(
-            "decode_dns_query: QNAME '{}' does not end with domain '{}'",
-            qname,
-            domain
-        );
+        bail!("decode_dns_query: QNAME '{}' does not end with domain '{}'", qname, domain);
     };
 
-    // Remove dots (label separators) inserted by dotify
     let undotted = undotify(subdomain);
-
-    // Base32 decode
     let quic_bytes = BASE32_NOPAD
         .decode(undotted.to_ascii_uppercase().as_bytes())
-        .with_context(|| format!("decode_dns_query: base32 decode failed for '{}'", undotted))?;
+        .with_context(|| format!("base32 decode failed for '{}'", undotted))?;
 
     Ok((id, quic_bytes))
 }

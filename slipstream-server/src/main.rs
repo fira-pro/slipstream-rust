@@ -163,19 +163,19 @@ struct DnsQueryPending {
 
 // ── DNS ↔ QUIC bridge ─────────────────────────────────────────────────────────
 
+use std::collections::HashMap;
+
+/// Reassembly state for one fragmented QUIC packet.
+struct FragState {
+    chunks: HashMap<u8, Vec<u8>>,
+    total: u8,
+    /// Keep the first fragment's query for responding once assembled.
+    first_query: DnsQueryPending,
+    /// All other fragment queries — respond with NXDOMAIN immediately.
+    other_queries: Vec<DnsQueryPending>,
+}
+
 /// Bridge task: DNS UDP socket ↔ quinn loopback socket.
-///
-/// ## Receive side (DNS→QUIC):
-///   - Reads a DNS query from the DNS UDP socket.
-///   - Decodes the QNAME to raw QUIC bytes.
-///   - Sends those bytes to `bridge_sock` (which quinn reads from its side).
-///   - Saves the original client address in `pending_queue`.
-///
-/// ## Send side (QUIC→DNS):
-///   - Reads a raw QUIC response from `bridge_sock` (which quinn wrote).
-///   - Looks up the oldest pending query to match the response.
-///   - Encodes the QUIC bytes as a DNS TXT response.
-///   - Sends the DNS response to the original client address.
 async fn run_bridge(
     dns_sock: Arc<UdpSocket>,
     bridge_sock: Arc<UdpSocket>,
@@ -185,6 +185,8 @@ async fn run_bridge(
 ) {
     let mut dns_buf = vec![0u8; 4096];
     let mut quic_buf = vec![0u8; 65536];
+    // Reassembly map: frag_id → FragState
+    let mut reassembly: HashMap<u16, FragState> = HashMap::new();
 
     loop {
         select! {
@@ -196,34 +198,83 @@ async fn run_bridge(
             // --- DNS → QUIC ---
             result = dns_sock.recv_from(&mut dns_buf) => {
                 match result {
-                    Err(e) => {
-                        warn!(%e, "DNS recv_from error");
-                        continue;
-                    }
+                    Err(e) => { warn!(%e, "DNS recv_from error"); continue; }
                     Ok((n, client_addr)) => {
-                        let wire = &dns_buf[..n];
-                        trace_packet("dns→quic", n, client_addr);
+                        let wire = dns_buf[..n].to_vec();
+                        trace_packet("dns→frag", n, client_addr);
 
-                        match decode_dns_query(wire, &domain) {
+                        let pending = DnsQueryPending {
+                            client_addr,
+                            query_wire: wire.clone(),
+                        };
+
+                        match slipstream_core::codec::decode_dns_query_frag(&wire, &domain) {
                             Err(e) => {
                                 debug!(%e, %client_addr, "ignoring non-tunnel DNS query");
-                                // Send NXDOMAIN so DNS resolvers don't time out
-                                if let Ok(resp) = encode_dns_response(wire, &[]) {
+                                if let Ok(resp) = encode_dns_response(&wire, &[]) {
                                     let _ = dns_sock.send_to(&resp, client_addr).await;
                                 }
                             }
-                            Ok((_id, quic_bytes)) => {
-                                // Remember this query
-                                {
-                                    let mut pq = pending_queue.lock().await;
-                                    pq.push_back(DnsQueryPending {
-                                        client_addr,
-                                        query_wire: wire.to_vec(),
+                            Ok((frag_id, seq, total, chunk)) => {
+                                if total == 1 {
+                                    // Single-fragment packet: inject directly
+                                    {
+                                        let mut pq = pending_queue.lock().await;
+                                        pq.push_back(pending);
+                                    }
+                                    if let Err(e) = bridge_sock.send(&chunk).await {
+                                        warn!(%e, "bridge: failed to inject QUIC packet");
+                                    }
+                                } else {
+                                    // Multi-fragment: accumulate
+                                    let entry = reassembly.entry(frag_id).or_insert_with(|| FragState {
+                                        chunks: HashMap::new(),
+                                        total,
+                                        first_query: pending.clone(),
+                                        other_queries: Vec::new(),
                                     });
-                                }
-                                // Inject raw QUIC into quinn
-                                if let Err(e) = bridge_sock.send(&quic_bytes).await {
-                                    warn!(%e, "bridge: failed to inject QUIC packet");
+
+                                    if seq == 0 {
+                                        entry.first_query = pending;
+                                    } else {
+                                        entry.other_queries.push(pending);
+                                    }
+                                    entry.chunks.insert(seq, chunk);
+
+                                    if entry.chunks.len() == entry.total as usize {
+                                        // All fragments received — assemble
+                                        let mut assembled = Vec::new();
+                                        for i in 0..entry.total {
+                                            if let Some(c) = entry.chunks.get(&i) {
+                                                assembled.extend_from_slice(c);
+                                            } else {
+                                                warn!(frag_id, seq=i, "missing fragment, dropping packet");
+                                                assembled.clear();
+                                                break;
+                                            }
+                                        }
+
+                                        if !assembled.is_empty() {
+                                            tracing::debug!(frag_id, total, bytes=assembled.len(), "reassembled QUIC packet");
+                                            // Send NXDOMAIN for non-first fragment queries right away
+                                            // (they don't need real QUIC responses)
+                                            let other_qs: Vec<_> = entry.other_queries.drain(..).collect();
+                                            for oq in other_qs {
+                                                if let Ok(resp) = encode_dns_response(&oq.query_wire, &[]) {
+                                                    let _ = dns_sock.send_to(&resp, oq.client_addr).await;
+                                                }
+                                            }
+                                            // Enqueue first query for the real QUIC response
+                                            {
+                                                let mut pq = pending_queue.lock().await;
+                                                pq.push_back(entry.first_query.clone());
+                                            }
+                                            if let Err(e) = bridge_sock.send(&assembled).await {
+                                                warn!(%e, "bridge: failed to inject reassembled QUIC");
+                                            }
+                                        }
+                                        reassembly.remove(&frag_id);
+                                    }
                                 }
                             }
                         }
@@ -234,13 +285,9 @@ async fn run_bridge(
             // --- QUIC → DNS ---
             result = bridge_sock.recv(&mut quic_buf) => {
                 match result {
-                    Err(e) => {
-                        warn!(%e, "bridge: QUIC recv error");
-                        continue;
-                    }
+                    Err(e) => { warn!(%e, "bridge: QUIC recv error"); continue; }
                     Ok(n) => {
                         let quic_data = &quic_buf[..n];
-                        // Pop the oldest pending query
                         let pending = {
                             let mut pq = pending_queue.lock().await;
                             pq.pop_front()
@@ -248,8 +295,6 @@ async fn run_bridge(
 
                         match pending {
                             None => {
-                                // quinn sending unsolicited data (e.g. connection close).
-                                // We have no query to respond to, so drop the packet.
                                 debug!("bridge: QUIC data with no pending query, dropping");
                             }
                             Some(p) => {

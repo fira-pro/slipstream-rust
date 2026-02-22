@@ -22,7 +22,7 @@ use anyhow::{bail, Context, Result};
 use clap::Parser;
 use quinn::{crypto::rustls::QuicClientConfig, ClientConfig, Connection, Endpoint};
 use slipstream_core::{
-    codec::{decode_dns_response, encode_dns_query},
+    codec::{decode_dns_response, encode_dns_queries},
     config::{ALPN_PROTOCOL, SERVER_SNI},
 };
 use tokio::{
@@ -173,11 +173,17 @@ async fn run_client_bridge(
                     Err(e) => { warn!(%e, "bridge: loopback recv error"); continue; }
                     Ok(n) => {
                         tracing::trace!(bytes = n, "client bridge: QUIC → DNS");
-                        match encode_dns_query(&quic_buf[..n], &domain) {
-                            Err(e) => warn!(%e, "bridge: encode_dns_query failed"),
-                            Ok(query) => {
-                                if let Err(e) = dns_sock.send(&query).await {
-                                    warn!(%e, "bridge: dns_sock send failed");
+                        match encode_dns_queries(&quic_buf[..n], &domain) {
+                            Err(e) => warn!(%e, "bridge: encode_dns_queries failed"),
+                            Ok(queries) => {
+                                for query in &queries {
+                                    if let Err(e) = dns_sock.send(query).await {
+                                        warn!(%e, "bridge: dns_sock send failed");
+                                        break;
+                                    }
+                                }
+                                if queries.len() > 1 {
+                                    tracing::trace!(frags = queries.len(), "bridge: sent fragmented QUIC packet");
                                 }
                             }
                         }
