@@ -22,7 +22,7 @@ use anyhow::{bail, Context, Result};
 use clap::Parser;
 use quinn::{crypto::rustls::QuicClientConfig, ClientConfig, Connection, Endpoint};
 use slipstream_core::{
-    codec::{decode_dns_response, encode_dns_queries},
+    codec::{decode_dns_response, encode_dns_queries, encode_dns_query},
     config::{ALPN_PROTOCOL, SERVER_SNI},
 };
 use tokio::{
@@ -30,9 +30,10 @@ use tokio::{
     net::{TcpListener, TcpStream, UdpSocket},
     select,
     sync::RwLock,
-    time::sleep,
+    time::{sleep, interval},
 };
 use tracing::{debug, error, info, warn};
+use rand::Rng;
 
 // ── CLI ────────────────────────────────────────────────────────────────────────
 
@@ -65,7 +66,7 @@ struct Args {
 
 // ── TLS/QUIC config ────────────────────────────────────────────────────────────
 
-fn build_client_config(accept_insecure: bool, keep_alive_ms: u64) -> Result<ClientConfig> {
+fn build_client_config(accept_insecure: bool, keep_alive_ms: u64, domain: &str) -> Result<ClientConfig> {
     let tls = if accept_insecure {
         let mut cfg = rustls::ClientConfig::builder()
             .dangerous()
@@ -85,8 +86,16 @@ fn build_client_config(accept_insecure: bool, keep_alive_ms: u64) -> Result<Clie
     let qc = QuicClientConfig::try_from(tls).context("building QUIC client config")?;
     let mut config = ClientConfig::new(Arc::new(qc));
 
+    // Compute max UDP payload size so post-handshake QUIC packets fit in one DNS query.
+    // QUIC Initial packets are still padded to 1200 bytes (RFC 9000 requirement),
+    // but all data-carrying packets after the handshake will be ≤ this size.
+    let max_payload = slipstream_core::codec::max_quic_chunk_size(domain)
+        .saturating_add(slipstream_core::codec::FRAG_HEADER_LEN) as u16;
+    let max_payload = max_payload.max(150); // floor to avoid breaking QUIC if domain too long
+
     let mut transport = quinn::TransportConfig::default();
     transport.max_idle_timeout(Some(Duration::from_secs(120).try_into().unwrap()));
+    transport.initial_max_udp_payload_size(max_payload);
     if keep_alive_ms > 0 {
         transport.keep_alive_interval(Some(Duration::from_millis(keep_alive_ms)));
     }
@@ -207,6 +216,43 @@ async fn run_client_bridge(
                             }
                         }
                     }
+                }
+            }
+        }
+    }
+}
+
+// ── Keepalive polling ─────────────────────────────────────────────────────────
+
+/// Periodically send empty DNS queries to the server.
+/// Each empty query adds one slot to the server's pending_queue, giving it
+/// space to push QUIC handshake/data packets back to us without waiting for
+/// our next real QUIC query. This is essential over high-latency links.
+async fn run_keepalive(
+    dns_sock: Arc<UdpSocket>,
+    domain: String,
+    mut shutdown: tokio::sync::broadcast::Receiver<()>,
+) {
+    // Send a keepalive every 50ms. At 200ms RTT this gives the server ~4 queued
+    // slots at any moment, enough for typical QUIC handshake traffic.
+    let mut tick = interval(Duration::from_millis(50));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        select! {
+            _ = shutdown.recv() => break,
+            _ = tick.tick() => {
+                // Keepalive payload: 4-byte frag header (seq=0, total=1) + 0 bytes of QUIC.
+                // The server recognises empty chunk → enqueues slot, doesn't inject to quinn.
+                let frag_id: u16 = rand::thread_rng().gen();
+                let payload = [
+                    (frag_id >> 8) as u8,
+                    (frag_id & 0xFF) as u8,
+                    0u8, // seq = 0
+                    1u8, // total = 1
+                ];
+                if let Ok(q) = encode_dns_query(&payload, &domain) {
+                    let _ = dns_sock.send(&q).await;
                 }
             }
         }
@@ -416,7 +462,7 @@ async fn main() -> Result<()> {
     let dns_sock = Arc::new(dns_sock);
 
     // ── Quinn endpoint ────────────────────────────────────────────────────────
-    let client_config = build_client_config(args.accept_insecure, args.keep_alive_interval)?;
+    let client_config = build_client_config(args.accept_insecure, args.keep_alive_interval, &args.domain)?;
     quinn_std_sock.set_nonblocking(true)?;
     let mut endpoint = Endpoint::new(
         quinn::EndpointConfig::default(),
@@ -437,6 +483,16 @@ async fn main() -> Result<()> {
         let rx = shutdown_tx.subscribe();
         tokio::spawn(async move {
             run_client_bridge(blsock, dsock, domain, rx).await;
+        });
+    }
+
+    // ── Spawn keepalive polling task ──────────────────────────────────────────
+    {
+        let dsock = Arc::clone(&dns_sock);
+        let domain = args.domain.clone();
+        let rx = shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            run_keepalive(dsock, domain, rx).await;
         });
     }
 
