@@ -1,0 +1,26 @@
+[workspace]
+members = [
+    "slipstream-core",
+    "slipstream-client",
+    "slipstream-server",
+]
+resolver = "2"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+quinn = { version = "0.11", features = ["runtime-tokio", "ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pemfile = "2"
+rcgen = { version = "0.13", features = ["ring"] }
+data-encoding = "2"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rand = "0.8"
+bytes = "1"
+anyhow = "1"
+thiserror = "2"
+hickory-proto = "0.24"
+tokio-util = { version = "0.7", features = ["io"] }
+futures = "0.3"
+socket2 = { version = "0.5", features = ["all"] }

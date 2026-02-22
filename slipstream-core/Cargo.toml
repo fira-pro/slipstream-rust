@@ -1,0 +1,13 @@
+[package]
+name = "slipstream-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { workspace = true }
+data-encoding = { workspace = true }
+tracing = { workspace = true }
+rand = { workspace = true }
+bytes = { workspace = true }
+anyhow = { workspace = true }
+socket2 = { workspace = true }
