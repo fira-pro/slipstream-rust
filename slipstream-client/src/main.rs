@@ -23,6 +23,7 @@ use quinn::{
 };
 use slipstream_core::config::{ALPN_PROTOCOL, SERVER_SNI};
 use tokio::{
+    io::AsyncWriteExt,
     net::{TcpListener, TcpStream},
     select,
     sync::RwLock,
@@ -78,10 +79,6 @@ fn build_client_config(accept_insecure: bool, keep_alive_ms: u64) -> Result<Clie
     } else {
         // Use system/embedded root CAs. Requires a proper cert on the server.
         // For testing with self-signed, use --accept-insecure.
-        let mut root_store = rustls::RootCertStore::empty();
-        // Extend with webpki roots if available. For now use an empty store — user
-        // should use --accept-insecure for self-signed certs.
-        let _ = root_store; // suppress unused warning
         let mut root_store = rustls::RootCertStore::empty();
         root_store.extend(
             rustls_native_certs_or_empty()

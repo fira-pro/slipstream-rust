@@ -19,7 +19,6 @@ use rand::Rng;
 const DNS_TYPE_TXT: u16 = 16;
 const DNS_TYPE_OPT: u16 = 41;
 const DNS_CLASS_IN: u16 = 1;
-const DNS_CLASS_ANY: u16 = 255; // used for OPT pseudo-RR
 
 /// Maximum number of bytes in a DNS label (RFC 1035 §2.3.4).
 const MAX_LABEL: usize = 63;
