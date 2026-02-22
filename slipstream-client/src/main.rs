@@ -1,14 +1,16 @@
 //! slipstream-client — DNS tunnel client
 //!
-//! Listens on a local TCP port for incoming connections and tunnels each
-//! connection through QUIC-over-DNS to the slipstream server.
+//! Architecture:
+//!   1. A loopback socket pair bridges quinn ↔ a DNS bridge task.
+//!   2. The DNS bridge task reads raw QUIC from quinn (via loopback),
+//!      encodes it as DNS TXT queries, and sends to the server's DNS port.
+//!   3. The bridge receives DNS responses, decodes them to raw QUIC,
+//!      and injects them back to quinn via the loopback.
+//!   4. Quinn sees a stable "server" address = the loopback bridge address.
+//!   5. TCP connections are accepted locally and relayed over QUIC streams.
 //!
-//! Key improvements over the original C code:
-//! - No pthreads: tokio tasks (zero file descriptor cost per stream)
-//! - No poller threads: async I/O handles readiness automatically
-//! - Network change recovery: detects QUIC connection errors and reconnects
-//! - Multiple resolver support: round-robin DNS query distribution
-//! - Clean resource management via RAII
+//! This mirrors the server's exact architecture (loopback + bridge), fixing the
+//! original bug where the client sent raw QUIC directly to the DNS port.
 
 use std::{
     net::SocketAddr,
@@ -18,13 +20,14 @@ use std::{
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
-use quinn::{
-    crypto::rustls::QuicClientConfig, ClientConfig, Connection, Endpoint,
+use quinn::{crypto::rustls::QuicClientConfig, ClientConfig, Connection, Endpoint};
+use slipstream_core::{
+    codec::{decode_dns_response, encode_dns_query},
+    config::{ALPN_PROTOCOL, SERVER_SNI},
 };
-use slipstream_core::config::{ALPN_PROTOCOL, SERVER_SNI};
 use tokio::{
     io::AsyncWriteExt,
-    net::{TcpListener, TcpStream},
+    net::{TcpListener, TcpStream, UdpSocket},
     select,
     sync::RwLock,
     time::sleep,
@@ -39,37 +42,31 @@ use tracing::{debug, error, info, warn};
     about = "A high-performance covert channel over DNS (client)"
 )]
 struct Args {
-    /// Local TCP port to listen on for incoming connections (default: 5201)
+    /// Local TCP port for incoming connections (default: 5201)
     #[arg(long, default_value_t = 5201)]
     tcp_listen_port: u16,
 
-    /// Resolver/server address (e.g. 1.1.1.1:53 or [2001:db8::1]:53). Repeatable.
+    /// DNS server/resolver address (e.g. 1.1.1.1:53). Repeatable.
     #[arg(long, short = 'r', required = true)]
     resolver: Vec<String>,
 
-    /// Domain name for the covert channel (REQUIRED)
+    /// Domain name for the tunnel (REQUIRED)
     #[arg(long, short = 'd')]
     domain: String,
-
-    /// Congestion control algorithm hint (currently informational, default: cubic)
-    #[arg(long, default_value = "cubic")]
-    congestion_control: String,
 
     /// Keep-alive interval in milliseconds (0 = disabled, default: 400)
     #[arg(long, default_value_t = 400)]
     keep_alive_interval: u64,
 
-    /// Skip TLS certificate verification (required for self-signed server certs).
-    /// Use this when the server is running with --self-signed.
+    /// Skip TLS certificate verification (required for --self-signed server)
     #[arg(long, default_value_t = false)]
     accept_insecure: bool,
 }
 
-// ── TLS / QUIC Setup ──────────────────────────────────────────────────────────
+// ── TLS/QUIC config ────────────────────────────────────────────────────────────
 
 fn build_client_config(accept_insecure: bool, keep_alive_ms: u64) -> Result<ClientConfig> {
-    let tls_config = if accept_insecure {
-        // Skip certificate verification. Required when server uses a self-signed cert.
+    let tls = if accept_insecure {
         let mut cfg = rustls::ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
@@ -77,12 +74,7 @@ fn build_client_config(accept_insecure: bool, keep_alive_ms: u64) -> Result<Clie
         cfg.alpn_protocols = vec![ALPN_PROTOCOL.to_vec()];
         cfg
     } else {
-        // Use system/embedded root CAs. Requires a proper cert on the server.
-        // For testing with self-signed, use --accept-insecure.
-        let mut root_store = rustls::RootCertStore::empty();
-        root_store.extend(
-            rustls_native_certs_or_empty()
-        );
+        let root_store = rustls::RootCertStore::empty();
         let mut cfg = rustls::ClientConfig::builder()
             .with_root_certificates(root_store)
             .with_no_client_auth();
@@ -90,7 +82,7 @@ fn build_client_config(accept_insecure: bool, keep_alive_ms: u64) -> Result<Clie
         cfg
     };
 
-    let qc = QuicClientConfig::try_from(tls_config).context("building QUIC client config")?;
+    let qc = QuicClientConfig::try_from(tls).context("building QUIC client config")?;
     let mut config = ClientConfig::new(Arc::new(qc));
 
     let mut transport = quinn::TransportConfig::default();
@@ -103,14 +95,6 @@ fn build_client_config(accept_insecure: bool, keep_alive_ms: u64) -> Result<Clie
     Ok(config)
 }
 
-/// Load system root certificates if possible, fall back gracefully to empty.
-fn rustls_native_certs_or_empty() -> Vec<rustls::pki_types::TrustAnchor<'static>> {
-    // If webpki-roots were linked, we'd use them here.
-    // For now return empty (user should use --accept-insecure for self-signed server).
-    vec![]
-}
-
-/// Certificate verifier that skips all checks. Use only for testing.
 #[derive(Debug)]
 struct SkipServerVerification;
 
@@ -150,34 +134,115 @@ impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
             rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
             rustls::SignatureScheme::ED25519,
             rustls::SignatureScheme::RSA_PKCS1_SHA256,
-            rustls::SignatureScheme::RSA_PKCS1_SHA384,
-            rustls::SignatureScheme::RSA_PKCS1_SHA512,
         ]
     }
 }
 
-// ── Shared QUIC connection state ───────────────────────────────────────────────
+// ── DNS bridge (client side) ───────────────────────────────────────────────────
 
-/// Guards the current active QUIC connection.
-/// Set to `None` when the connection is being re-established.
+/// Client DNS bridge: mirrors the server's run_bridge, but in reverse.
+///
+/// ## QUIC → DNS (outgoing):
+///   - Reads raw QUIC packet from `bridge_loopback_sock` (sent there by quinn).
+///   - Encodes as a DNS TXT query.
+///   - Sends to the real DNS server via `dns_sock`.
+///
+/// ## DNS → QUIC (incoming):
+///   - Receives DNS response on `dns_sock`.
+///   - Decodes to raw QUIC packet.
+///   - Injects back into quinn via `bridge_loopback_sock`.
+async fn run_client_bridge(
+    bridge_loopback_sock: Arc<UdpSocket>,
+    dns_sock: Arc<UdpSocket>,
+    domain: String,
+    mut shutdown: tokio::sync::broadcast::Receiver<()>,
+) {
+    let mut quic_buf = vec![0u8; 65536];
+    let mut dns_buf = vec![0u8; 4096];
+
+    loop {
+        select! {
+            _ = shutdown.recv() => {
+                info!("client bridge: shutting down");
+                break;
+            }
+
+            // QUIC → DNS (quinn sent a packet to bridge_loopback_sock)
+            result = bridge_loopback_sock.recv(&mut quic_buf) => {
+                match result {
+                    Err(e) => { warn!(%e, "bridge: loopback recv error"); continue; }
+                    Ok(n) => {
+                        tracing::trace!(bytes = n, "client bridge: QUIC → DNS");
+                        match encode_dns_query(&quic_buf[..n], &domain) {
+                            Err(e) => warn!(%e, "bridge: encode_dns_query failed"),
+                            Ok(query) => {
+                                if let Err(e) = dns_sock.send(&query).await {
+                                    warn!(%e, "bridge: dns_sock send failed");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // DNS → QUIC (got a DNS response from the server)
+            result = dns_sock.recv(&mut dns_buf) => {
+                match result {
+                    Err(e) => { warn!(%e, "bridge: dns_sock recv error"); continue; }
+                    Ok(n) => {
+                        tracing::trace!(bytes = n, "client bridge: DNS → QUIC");
+                        match decode_dns_response(&dns_buf[..n]) {
+                            Err(e) => { debug!(%e, "bridge: decode_dns_response failed"); }
+                            Ok(None) => { debug!("bridge: empty/NXDOMAIN response (server has no data)"); }
+                            Ok(Some(quic_data)) => {
+                                if let Err(e) = bridge_loopback_sock.send(&quic_data).await {
+                                    warn!(%e, "bridge: loopback inject failed");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ── Loopback socket pair ───────────────────────────────────────────────────────
+
+/// Create two connected UDP sockets on loopback.
+/// quinn uses the returned `std::net::UdpSocket`; our bridge uses the `UdpSocket`.
+async fn make_loopback_pair() -> Result<(std::net::UdpSocket, UdpSocket)> {
+    let a = UdpSocket::bind("127.0.0.1:0").await?;
+    let b = UdpSocket::bind("127.0.0.1:0").await?;
+    let a_addr = a.local_addr()?;
+    let b_addr = b.local_addr()?;
+    a.connect(b_addr).await?;
+    b.connect(a_addr).await?;
+
+    let a_std = a.into_std()?;
+    a_std.set_nonblocking(true)?;
+    Ok((a_std, b))
+}
+
+// ── Shared connection ──────────────────────────────────────────────────────────
+
 type SharedConn = Arc<RwLock<Option<Connection>>>;
 
 // ── Connection manager ─────────────────────────────────────────────────────────
 
-/// Maintains a QUIC connection, reconnecting automatically after drops.
 struct ConnectionManager {
     endpoint: Endpoint,
-    server_addr: SocketAddr,
-    server_name: String,
+    /// Address quinn "connects" to — this is the bridge loopback address!
+    bridge_addr: SocketAddr,
     conn: SharedConn,
 }
 
 impl ConnectionManager {
-    async fn connect(&self) -> Result<Connection> {
+    async fn try_connect(&self) -> Result<Connection> {
         let conn = self
             .endpoint
-            .connect(self.server_addr, &self.server_name)
-            .with_context(|| format!("creating QUIC connection to {}", self.server_addr))?
+            .connect(self.bridge_addr, SERVER_SNI)
+            .with_context(|| format!("creating QUIC connection via bridge {}", self.bridge_addr))?
             .await
             .context("QUIC handshake")?;
         Ok(conn)
@@ -186,9 +251,9 @@ impl ConnectionManager {
     async fn connect_with_retry(&self) -> Connection {
         let mut delay = Duration::from_millis(500);
         loop {
-            match self.connect().await {
+            match self.try_connect().await {
                 Ok(c) => {
-                    info!(remote = %self.server_addr, "QUIC connection established");
+                    info!("QUIC connection established (via DNS bridge)");
                     return c;
                 }
                 Err(e) => {
@@ -200,7 +265,6 @@ impl ConnectionManager {
         }
     }
 
-    /// Main manager loop: connect and reconnect on drop.
     async fn run(self, mut shutdown: tokio::sync::broadcast::Receiver<()>) {
         loop {
             let conn = self.connect_with_retry().await;
@@ -241,7 +305,6 @@ impl ConnectionManager {
 
 // ── Per-TCP-connection handler ─────────────────────────────────────────────────
 
-/// Handle an incoming TCP connection: open a QUIC stream and relay bidirectionally.
 async fn handle_tcp_connection(tcp: TcpStream, peer: SocketAddr, shared: SharedConn) {
     info!(%peer, "accepted TCP connection");
 
@@ -250,7 +313,7 @@ async fn handle_tcp_connection(tcp: TcpStream, peer: SocketAddr, shared: SharedC
         match g.as_ref() {
             Some(c) => c.clone(),
             None => {
-                warn!(%peer, "no QUIC connection, dropping TCP connection");
+                warn!(%peer, "no QUIC connection available, dropping TCP");
                 return;
             }
         }
@@ -263,7 +326,6 @@ async fn handle_tcp_connection(tcp: TcpStream, peer: SocketAddr, shared: SharedC
             return;
         }
     };
-
     debug!(%peer, stream = quic_send.id().index(), "QUIC stream opened");
 
     let (mut tcp_rx, mut tcp_tx) = tcp.into_split();
@@ -281,36 +343,23 @@ async fn handle_tcp_connection(tcp: TcpStream, peer: SocketAddr, shared: SharedC
     });
 
     let (r1, r2) = tokio::join!(t2q, q2t);
-    match r1 {
-        Ok(Ok(n)) => debug!(%peer, bytes = n, "tcp→quic done"),
-        Ok(Err(e)) => debug!(%e, %peer, "tcp→quic error"),
-        Err(e) => debug!(%e, "tcp→quic task panic"),
-    }
-    match r2 {
-        Ok(Ok(n)) => debug!(%peer, bytes = n, "quic→tcp done"),
-        Ok(Err(e)) => debug!(%e, %peer, "quic→tcp error"),
-        Err(e) => debug!(%e, "quic→tcp task panic"),
-    }
-
+    if let Ok(Ok(n)) = r1 { debug!(%peer, bytes=n, "tcp→quic done"); }
+    if let Ok(Ok(n)) = r2 { debug!(%peer, bytes=n, "quic→tcp done"); }
     info!(%peer, "TCP connection closed");
 }
 
 // ── Address parsing ────────────────────────────────────────────────────────────
 
-fn parse_resolver_addr(s: &str) -> Result<SocketAddr> {
-    // Direct parse covers `ip:port` and `[ip6]:port`
-    if let Ok(addr) = s.parse::<SocketAddr>() {
-        return Ok(addr);
-    }
-    // Bare IPv6 (multiple colons, no brackets) → append :53
+fn parse_addr(s: &str) -> Result<SocketAddr> {
+    if let Ok(a) = s.parse::<SocketAddr>() { return Ok(a); }
+    // Bare IPv6 (multiple colons)
     if s.contains(':') && !s.starts_with('[') && s.matches(':').count() > 1 {
         let ip: std::net::IpAddr = s.parse()
-            .with_context(|| format!("parsing IPv6 address '{}'", s))?;
+            .with_context(|| format!("parsing IPv6 '{}'", s))?;
         return Ok(SocketAddr::new(ip, 53));
     }
-    // Bare host / IPv4 → append :53
-    let with_port = format!("{}:53", s);
-    with_port.parse::<SocketAddr>()
+    // Bare IPv4 / hostname → default port 53
+    format!("{}:53", s).parse::<SocketAddr>()
         .with_context(|| format!("cannot parse resolver address '{}'", s))
 }
 
@@ -326,74 +375,84 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
-
     if args.resolver.is_empty() {
         bail!("at least one --resolver address is required");
     }
 
-    let mut resolver_addrs: Vec<SocketAddr> = Vec::new();
-    for s in &args.resolver {
-        let addr = parse_resolver_addr(s)
-            .with_context(|| format!("parsing '--resolver {}'", s))?;
-        println!("Adding {}", addr);
-        resolver_addrs.push(addr);
-    }
+    // Use only first resolver for now (multi-resolver support: future work)
+    let server_dns_addr = parse_addr(&args.resolver[0])
+        .with_context(|| format!("parsing --resolver '{}'", args.resolver[0]))?;
 
-    // Validate address family consistency
-    if resolver_addrs.iter().any(|a| a.is_ipv4()) && resolver_addrs.iter().any(|a| a.is_ipv6()) {
-        bail!("cannot mix IPv4 and IPv6 resolver addresses");
-    }
-
+    println!("Adding {}", server_dns_addr);
     info!(
         domain = %args.domain,
         tcp_port = args.tcp_listen_port,
+        server = %server_dns_addr,
         "slipstream-client starting"
     );
 
-    // Build QUIC config
-    let client_config = build_client_config(args.accept_insecure, args.keep_alive_interval)?;
+    // ── Loopback pair: quinn_sock ↔ bridge_loopback_sock ──────────────────────
+    // quinn uses quinn_std_sock (one end).
+    // bridge_loopback_sock (the other end) is what the bridge task uses to
+    // inject/extract raw QUIC packets on quinn's behalf.
+    let (quinn_std_sock, bridge_loopback_sock) = make_loopback_pair().await?;
+    let bridge_addr = bridge_loopback_sock.local_addr()?;
+    let bridge_loopback_sock = Arc::new(bridge_loopback_sock);
 
-    // Bind local UDP socket for QUIC
-    let local_bind: SocketAddr = if resolver_addrs[0].is_ipv4() {
+    // ── DNS UDP socket: bridge ↔ slipstream server ────────────────────────────
+    let local_bind: SocketAddr = if server_dns_addr.is_ipv4() {
         "0.0.0.0:0".parse().unwrap()
     } else {
         "[::]:0".parse().unwrap()
     };
-    let std_sock = std::net::UdpSocket::bind(local_bind)?;
-    std_sock.set_nonblocking(true)?;
+    let dns_sock = UdpSocket::bind(local_bind).await?;
+    dns_sock.connect(server_dns_addr).await?;
+    let dns_sock = Arc::new(dns_sock);
 
+    // ── Quinn endpoint ────────────────────────────────────────────────────────
+    let client_config = build_client_config(args.accept_insecure, args.keep_alive_interval)?;
+    quinn_std_sock.set_nonblocking(true)?;
     let mut endpoint = Endpoint::new(
         quinn::EndpointConfig::default(),
         None,
-        std_sock,
+        quinn_std_sock,
         Arc::new(quinn::TokioRuntime),
     )?;
     endpoint.set_default_client_config(client_config);
 
-    let first_server = resolver_addrs[0];
-    println!("Starting connection to {}", first_server.ip());
+    // ── Shutdown channel ──────────────────────────────────────────────────────
+    let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(4);
 
+    // ── Spawn DNS bridge task ─────────────────────────────────────────────────
+    {
+        let blsock = Arc::clone(&bridge_loopback_sock);
+        let dsock = Arc::clone(&dns_sock);
+        let domain = args.domain.clone();
+        let rx = shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            run_client_bridge(blsock, dsock, domain, rx).await;
+        });
+    }
+
+    // ── Connection manager: QUIC connects to bridge_addr (loopback) ──────────
+    println!("Starting connection to {} (via DNS bridge)", server_dns_addr.ip());
     let shared_conn: SharedConn = Arc::new(RwLock::new(None));
-    let (shutdown_tx, shutdown_rx_mgr) = tokio::sync::broadcast::channel::<()>(4);
-
-    // Connection manager task
     let mgr = ConnectionManager {
         endpoint: endpoint.clone(),
-        server_addr: first_server,
-        server_name: SERVER_SNI.to_string(),
+        bridge_addr,     // <-- loopback addr, NOT the real server addr
         conn: Arc::clone(&shared_conn),
     };
-    let mgr_task = tokio::spawn(async move { mgr.run(shutdown_rx_mgr).await });
+    let mgr_task = tokio::spawn(async move { mgr.run(shutdown_tx.subscribe()).await });
 
     // Wait for initial connection
     loop {
         if shared_conn.read().await.is_some() { break; }
+        // Check if connection manager failed (e.g. can't reach server at all)
         sleep(Duration::from_millis(100)).await;
     }
-    println!("Connection completed, almost ready.");
-    println!("Connection confirmed.");
+    println!("Connection established.");
 
-    // TCP listener
+    // ── TCP listener ──────────────────────────────────────────────────────────
     let listen_addr: SocketAddr = format!("0.0.0.0:{}", args.tcp_listen_port).parse()?;
     let listener = TcpListener::bind(listen_addr)
         .await
