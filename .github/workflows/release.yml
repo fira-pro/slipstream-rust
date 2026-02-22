@@ -16,15 +16,20 @@ env:
   CARGO_INCREMENTAL: 0
 
 jobs:
-  # ── Linux (Ubuntu 20.04 x86_64) ─────────────────────────────────────────────
+  # ── Linux x86_64 (musl static, runs on any Linux ≥ Ubuntu 20) ───────────────
   build-linux:
-    name: Linux x86_64 (Ubuntu 20.04)
-    runs-on: ubuntu-20.04
+    name: Linux x86_64 (static musl)
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust stable
+      - name: Install Rust stable + musl target
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Install musl toolchain
+        run: sudo apt-get install -y musl-tools
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -33,16 +38,22 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: linux-x86_64-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: linux-musl-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Build release binaries
-        run: cargo build --release -p slipstream-client -p slipstream-server
+      - name: Build release binaries (musl)
+        run: |
+          cargo build --release \
+            --target x86_64-unknown-linux-musl \
+            -p slipstream-client \
+            -p slipstream-server
 
       - name: Prepare artifacts
         run: |
           mkdir -p dist
-          cp target/release/slipstream-client dist/slipstream-client-linux-x86_64
-          cp target/release/slipstream-server dist/slipstream-server-linux-x86_64
+          cp target/x86_64-unknown-linux-musl/release/slipstream-client \
+             dist/slipstream-client-linux-x86_64
+          cp target/x86_64-unknown-linux-musl/release/slipstream-server \
+             dist/slipstream-server-linux-x86_64
           chmod +x dist/*
 
       - uses: actions/upload-artifact@v4
