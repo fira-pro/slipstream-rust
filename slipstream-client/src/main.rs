@@ -442,7 +442,8 @@ async fn main() -> Result<()> {
         bridge_addr,     // <-- loopback addr, NOT the real server addr
         conn: Arc::clone(&shared_conn),
     };
-    let mgr_task = tokio::spawn(async move { mgr.run(shutdown_tx.subscribe()).await });
+    let shutdown_tx_mgr = shutdown_tx.clone();
+    let mgr_task = tokio::spawn(async move { mgr.run(shutdown_tx_mgr.subscribe()).await });
 
     // Wait for initial connection
     loop {
