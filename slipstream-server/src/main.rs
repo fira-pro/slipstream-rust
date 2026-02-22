@@ -20,7 +20,6 @@
 //! - Correct cleanup on connection drop via async drop/RAII
 
 use std::{
-    collections::VecDeque,
     net::SocketAddr,
     path::PathBuf,
     sync::Arc,
@@ -39,7 +38,6 @@ use tokio::{
     io::AsyncWriteExt,
     net::{TcpStream, UdpSocket},
     select,
-    sync::Mutex,
 };
 use tracing::{debug, info, warn};
 
@@ -150,22 +148,10 @@ async fn make_loopback_pair() -> Result<(std::net::UdpSocket, UdpSocket)> {
     Ok((a_std, b))
 }
 
-// ── Pending query state ─────────────────────────────────────────────────────────
-
-/// For each DNS query we receive, remember where to send the response.
-#[derive(Debug, Clone)]
-struct DnsQueryPending {
-    /// Original UDP sender of the DNS query (the DNS resolver or client).
-    client_addr: SocketAddr,
-    /// Raw wire bytes of the DNS query (to reconstruct response).
-    query_wire: Vec<u8>,
-}
-
 // ── DNS ↔ QUIC bridge ─────────────────────────────────────────────────────────
 
 use std::collections::HashMap;
 
-/// Reassembly state for one fragmented QUIC packet.
 struct FragState {
     chunks: HashMap<u8, Vec<u8>>,
     total: u8,
@@ -173,21 +159,35 @@ struct FragState {
 
 /// Bridge task: DNS UDP socket ↔ quinn loopback socket.
 ///
-/// Key design: every incoming DNS query (fragment or not) is immediately
-/// enqueued in `pending_queue` as a response slot. This ensures quinn
-/// always has enough outbound slots even with high-latency connections.
-/// Reassembly runs in parallel; once all fragments arrive the assembled
-/// QUIC packet is injected into quinn.
+/// ## Architecture change (output-queue model):
+///
+/// PREVIOUS MODEL (broken for external resolvers):
+///   DNS query arrives → saved in pending_queue → wait for quinn → respond
+///   Problem: recursive resolvers time out (2-5s) waiting for quinn.
+///   Problem: stale pending entries corrupt new connections on reconnect.
+///
+/// NEW MODEL (output-queue):
+///   quinn produces QUIC packet → saved in output_queue (bounded ring buffer)
+///   DNS query arrives → immediately respond with front of output_queue OR NXDOMAIN
+///
+///   Benefits:
+///   - DNS query is ALWAYS answered instantly (resolver never times out)
+///   - No persistent state between connections (reconnect just works)
+///   - NXDOMAIN responses are fine: client's keepalive loop retries in 50ms
 async fn run_bridge(
     dns_sock: Arc<UdpSocket>,
     bridge_sock: Arc<UdpSocket>,
     domain: String,
-    pending_queue: Arc<Mutex<VecDeque<DnsQueryPending>>>,
     mut shutdown: tokio::sync::broadcast::Receiver<()>,
 ) {
     let mut dns_buf = vec![0u8; 4096];
     let mut quic_buf = vec![0u8; 65536];
     let mut reassembly: HashMap<u16, FragState> = HashMap::new();
+
+    // Outbound QUIC packets from quinn, waiting for a DNS query to carry them.
+    // Bounded to avoid unbounded growth; oldest packets dropped if full.
+    let mut output_q: VecDeque<Vec<u8>> = VecDeque::new();
+    const MAX_OUTPUT_Q: usize = 128;
 
     loop {
         select! {
@@ -196,7 +196,7 @@ async fn run_bridge(
                 break;
             }
 
-            // --- DNS → QUIC ---
+            // --- DNS query arrived → inject QUIC payload → reply immediately ---
             result = dns_sock.recv_from(&mut dns_buf) => {
                 match result {
                     Err(e) => { warn!(%e, "DNS recv_from error"); continue; }
@@ -206,65 +206,60 @@ async fn run_bridge(
 
                         match slipstream_core::codec::decode_dns_query_frag(&wire, &domain) {
                             Err(e) => {
-                                // Not a tunnel query (e.g. real DNS traffic) — NXDOMAIN
                                 debug!(%e, %client_addr, "ignoring non-tunnel DNS query");
                                 if let Ok(resp) = encode_dns_response(&wire, &[]) {
                                     let _ = dns_sock.send_to(&resp, client_addr).await;
                                 }
                             }
                             Ok((frag_id, seq, total, chunk)) => {
-                                // ─── STEP 1: Enqueue this query as a response slot immediately.
-                                // Every query (fragment or keepalive) gives us one outbound slot.
-                                // This is the critical fix: with internet latency, quinn generates
-                                // multiple response packets before the next client query arrives.
-                                // By pre-filling the queue with ALL fragment queries we ensure
-                                // the server has enough slots for the full handshake.
-                                {
-                                    let mut pq = pending_queue.lock().await;
-                                    pq.push_back(DnsQueryPending { client_addr, query_wire: wire.clone() });
-                                }
+                                // ── Step 1: inject incoming QUIC data into quinn ──
+                                if !chunk.is_empty() {
+                                    if total == 1 {
+                                        // Single fragment — inject directly
+                                        if let Err(e) = bridge_sock.send(&chunk).await {
+                                            warn!(%e, "bridge: inject failed");
+                                        }
+                                    } else {
+                                        // Multi-fragment — reassemble first
+                                        let entry = reassembly.entry(frag_id).or_insert_with(|| FragState {
+                                            chunks: HashMap::new(),
+                                            total,
+                                        });
+                                        entry.chunks.insert(seq, chunk);
 
-                                // ─── STEP 2: If keepalive (empty chunk), nothing to inject.
-                                if chunk.is_empty() {
-                                    tracing::trace!(%client_addr, "keepalive slot added");
-                                    continue;
-                                }
-
-                                // ─── STEP 3: Single-fragment → inject directly.
-                                if total == 1 {
-                                    if let Err(e) = bridge_sock.send(&chunk).await {
-                                        warn!(%e, "bridge: failed to inject QUIC packet");
-                                    }
-                                    continue;
-                                }
-
-                                // ─── STEP 4: Multi-fragment → accumulate and inject when complete.
-                                let entry = reassembly.entry(frag_id).or_insert_with(|| FragState {
-                                    chunks: HashMap::new(),
-                                    total,
-                                });
-                                entry.chunks.insert(seq, chunk);
-
-                                if entry.chunks.len() == entry.total as usize {
-                                    let mut assembled = Vec::new();
-                                    let mut ok = true;
-                                    for i in 0..entry.total {
-                                        match entry.chunks.get(&i) {
-                                            Some(c) => assembled.extend_from_slice(c),
-                                            None => {
-                                                warn!(frag_id, seq=i, "missing fragment, dropping");
-                                                ok = false;
-                                                break;
+                                        if entry.chunks.len() == entry.total as usize {
+                                            let mut assembled = Vec::new();
+                                            let mut ok = true;
+                                            for i in 0..entry.total {
+                                                match entry.chunks.get(&i) {
+                                                    Some(c) => assembled.extend_from_slice(c),
+                                                    None => { ok = false; break; }
+                                                }
                                             }
+                                            if ok {
+                                                tracing::debug!(frag_id, total, bytes=assembled.len(), "reassembled");
+                                                if let Err(e) = bridge_sock.send(&assembled).await {
+                                                    warn!(%e, "bridge: inject assembled failed");
+                                                }
+                                            }
+                                            reassembly.remove(&frag_id);
                                         }
                                     }
-                                    if ok {
-                                        tracing::debug!(frag_id, total, bytes=assembled.len(), "reassembled");
-                                        if let Err(e) = bridge_sock.send(&assembled).await {
-                                            warn!(%e, "bridge: failed to inject reassembled QUIC");
+                                }
+
+                                // ── Step 2: respond immediately with buffered QUIC or NXDOMAIN ──
+                                // This is the key change: server ALWAYS replies instantly.
+                                // Recursive resolvers never time out. Reconnects are clean.
+                                let quic_out = output_q.pop_front();
+                                let resp_data: &[u8] = quic_out.as_deref().unwrap_or(&[]);
+                                match encode_dns_response(&wire, resp_data) {
+                                    Err(e) => warn!(%e, "bridge: encode response failed"),
+                                    Ok(resp) => {
+                                        trace_packet("quic→dns", resp_data.len(), client_addr);
+                                        if let Err(e) = dns_sock.send_to(&resp, client_addr).await {
+                                            warn!(%e, "bridge: send response failed");
                                         }
                                     }
-                                    reassembly.remove(&frag_id);
                                 }
                             }
                         }
@@ -272,41 +267,26 @@ async fn run_bridge(
                 }
             }
 
-            // --- QUIC → DNS ---
+            // --- QUIC packet from quinn → push to output buffer ---
             result = bridge_sock.recv(&mut quic_buf) => {
                 match result {
                     Err(e) => { warn!(%e, "bridge: QUIC recv error"); continue; }
                     Ok(n) => {
-                        let quic_data = &quic_buf[..n];
-                        let pending = {
-                            let mut pq = pending_queue.lock().await;
-                            pq.pop_front()
-                        };
-                        match pending {
-                            None => {
-                                // No query slot available — drop. Client keepalives will
-                                // replenish slots; quinn will retransmit if needed.
-                                debug!("bridge: no pending slot for QUIC response, dropping");
-                            }
-                            Some(p) => {
-                                trace_packet("quic→dns", n, p.client_addr);
-                                match encode_dns_response(&p.query_wire, quic_data) {
-                                    Err(e) => warn!(%e, "failed to encode DNS response"),
-                                    Ok(resp) => {
-                                        if let Err(e) = dns_sock.send_to(&resp, p.client_addr).await {
-                                            warn!(%e, "failed to send DNS response");
-                                        }
-                                    }
-                                }
-                            }
+                        let data = quic_buf[..n].to_vec();
+                        if output_q.len() >= MAX_OUTPUT_Q {
+                            // Ring buffer overflow: drop the oldest packet.
+                            // Quinn will retransmit; this is better than starvation.
+                            output_q.pop_front();
+                            debug!("bridge: output_q overflow, dropped oldest QUIC packet");
                         }
+                        output_q.push_back(data);
+                        tracing::trace!(q_len = output_q.len(), "quic→output_q");
                     }
                 }
             }
         }
     }
 }
-
 
 
 
@@ -438,9 +418,6 @@ async fn main() -> Result<()> {
     )?;
     info!("QUIC endpoint ready");
 
-    // Pending query queue (shared between bridge task and nothing else for now)
-    let pending_queue: Arc<Mutex<VecDeque<DnsQueryPending>>> = Arc::new(Mutex::new(VecDeque::new()));
-
     // Shutdown broadcast
     let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(4);
 
@@ -448,11 +425,10 @@ async fn main() -> Result<()> {
     {
         let dns_sock = Arc::clone(&dns_sock);
         let bridge_sock = Arc::clone(&bridge_sock);
-        let pending_queue = Arc::clone(&pending_queue);
         let domain = args.domain.clone();
         let rx = shutdown_tx.subscribe();
         tokio::spawn(async move {
-            run_bridge(dns_sock, bridge_sock, domain, pending_queue, rx).await;
+            run_bridge(dns_sock, bridge_sock, domain, rx).await;
         });
     }
 
