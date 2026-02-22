@@ -66,7 +66,7 @@ struct Args {
 
 // ── TLS/QUIC config ────────────────────────────────────────────────────────────
 
-fn build_client_config(accept_insecure: bool, keep_alive_ms: u64, domain: &str) -> Result<ClientConfig> {
+fn build_client_config(accept_insecure: bool, keep_alive_ms: u64) -> Result<ClientConfig> {
     let tls = if accept_insecure {
         let mut cfg = rustls::ClientConfig::builder()
             .dangerous()
@@ -86,16 +86,8 @@ fn build_client_config(accept_insecure: bool, keep_alive_ms: u64, domain: &str) 
     let qc = QuicClientConfig::try_from(tls).context("building QUIC client config")?;
     let mut config = ClientConfig::new(Arc::new(qc));
 
-    // Compute max UDP payload size so post-handshake QUIC packets fit in one DNS query.
-    // QUIC Initial packets are still padded to 1200 bytes (RFC 9000 requirement),
-    // but all data-carrying packets after the handshake will be ≤ this size.
-    let max_payload = slipstream_core::codec::max_quic_chunk_size(domain)
-        .saturating_add(slipstream_core::codec::FRAG_HEADER_LEN) as u16;
-    let max_payload = max_payload.max(150); // floor to avoid breaking QUIC if domain too long
-
     let mut transport = quinn::TransportConfig::default();
     transport.max_idle_timeout(Some(Duration::from_secs(120).try_into().unwrap()));
-    transport.initial_max_udp_payload_size(max_payload);
     if keep_alive_ms > 0 {
         transport.keep_alive_interval(Some(Duration::from_millis(keep_alive_ms)));
     }
@@ -462,7 +454,7 @@ async fn main() -> Result<()> {
     let dns_sock = Arc::new(dns_sock);
 
     // ── Quinn endpoint ────────────────────────────────────────────────────────
-    let client_config = build_client_config(args.accept_insecure, args.keep_alive_interval, &args.domain)?;
+    let client_config = build_client_config(args.accept_insecure, args.keep_alive_interval)?;
     quinn_std_sock.set_nonblocking(true)?;
     let mut endpoint = Endpoint::new(
         quinn::EndpointConfig::default(),

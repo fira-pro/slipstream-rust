@@ -32,7 +32,7 @@ use clap::Parser;
 use quinn::{crypto::rustls::QuicServerConfig, Endpoint, EndpointConfig, ServerConfig};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use slipstream_core::{
-    codec::{decode_dns_query, encode_dns_response},
+    codec::encode_dns_response,
     config::{ALPN_PROTOCOL, SERVER_SNI},
 };
 use tokio::{
