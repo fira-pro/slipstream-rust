@@ -66,7 +66,7 @@ struct Args {
 
 // ── TLS/QUIC config ────────────────────────────────────────────────────────────
 
-fn build_client_config(accept_insecure: bool, keep_alive_ms: u64) -> Result<ClientConfig> {
+fn build_client_config(accept_insecure: bool, keep_alive_ms: u64, domain: &str) -> Result<ClientConfig> {
     let tls = if accept_insecure {
         let mut cfg = rustls::ClientConfig::builder()
             .dangerous()
@@ -95,33 +95,42 @@ fn build_client_config(accept_insecure: bool, keep_alive_ms: u64) -> Result<Clie
     }
 
     // ── Congestion control ───────────────────────────────────────────────────
-    // BBR probes for bandwidth and RTT rather than reacting to loss signals.
-    // DNS tunnels see a lot of "loss" that is actually NXDOMAIN responses
-    // or resolver deduplication — BBR handles this far better than NewReno.
+    // BBR probes bandwidth+RTT instead of reacting to loss. DNS NXDOMAINs
+    // look like loss to NewReno, so BBR is a much better fit.
     transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
 
     // ── Window sizes ─────────────────────────────────────────────────────────
-    transport.send_window(8 * 1024 * 1024);                               // 8 MB
-    transport.receive_window(quinn::VarInt::from_u32(8 * 1024 * 1024));   // 8 MB
-    transport.stream_receive_window(quinn::VarInt::from_u32(4 * 1024 * 1024)); // 4 MB per stream
+    // 512 KB is plenty for a DNS tunnel at ~5-50 KB/s effective bandwidth.
+    // Larger windows cause QUIC to buffer hundreds of KB locally and report
+    // "fast" speeds before DNS has actually delivered the data (fake speed).
+    transport.send_window(512 * 1024);                                    // 512 KB
+    transport.receive_window(quinn::VarInt::from_u32(512 * 1024));        // 512 KB
+    transport.stream_receive_window(quinn::VarInt::from_u32(256 * 1024)); // 256 KB per stream
 
-    // ── MTU discovery ────────────────────────────────────────────────────────
-    // DNS path MTU is fixed by our encoding (~512 bytes per query).
-    // PMTUD probes will always appear to fail — disable them.
-    transport.mtu_discovery_config(None);
+    // ── MTU: match what C code does: mtu = (240 - domain_len) / 1.6 ──────────
+    // This tells quinn to cap outgoing QUIC packets to the size that fits
+    // in one DNS query (post-handshake). QUIC Initial packets are still padded
+    // to 1200 bytes per RFC 9000, but all data packets will be small.
+    // We use MtuDiscoveryConfig upper_bound instead of None so quinn actually
+    // learns and uses this MTU after the config probes settle.
+    let mtu = ((240.0 - domain.len() as f64) / 1.6) as u16;
+    let mtu = mtu.max(60).min(1200); // safety bounds
+    let mut mtu_cfg = quinn::MtuDiscoveryConfig::default();
+    mtu_cfg.upper_bound(mtu);
+    transport.mtu_discovery_config(Some(mtu_cfg));
 
     // ── Multiplexing ─────────────────────────────────────────────────────────
     transport.max_concurrent_bidi_streams(quinn::VarInt::from_u32(256));
 
-    // ── Initial RTT estimate ──────────────────────────────────────────────────
-    // Start with a realistic guess for DNS tunnel latency (resolver + auth server).
-    // This avoids QUIC being overly conservative in the first few seconds.
+    // ── Initial RTT estimate ─────────────────────────────────────────────────
     transport.initial_rtt(Duration::from_millis(400));
 
     config.transport_config(Arc::new(transport));
 
     Ok(config)
 }
+
+
 
 #[derive(Debug)]
 struct SkipServerVerification;
@@ -243,18 +252,15 @@ async fn run_client_bridge(
 
 // ── Keepalive polling ─────────────────────────────────────────────────────────
 
-/// Periodically send empty DNS queries to the server.
-/// Each empty query adds one slot to the server's pending_queue, giving it
-/// space to push QUIC handshake/data packets back to us without waiting for
-/// our next real QUIC query. This is essential over high-latency links.
+/// Periodically send empty DNS queries to the server ("poll" in TurboTunnel terms).
+/// Each query gives the server one opportunity to push back a QUIC packet.
 async fn run_keepalive(
     dns_sock: Arc<UdpSocket>,
     domain: String,
     mut shutdown: tokio::sync::broadcast::Receiver<()>,
 ) {
-    // Send a keepalive every 20ms (50/sec). At 400ms DNS RTT this maintains
-    // ~20 outstanding query slots at any moment — enough to sustain throughput
-    // without hitting resolver rate limits.
+    // 20ms keeps ~20 slots outstanding at 400ms RTT — enough for good throughput.
+    // If the resolver rate-limits us, we back off automatically via error handling.
     let mut tick = interval(Duration::from_millis(20));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -262,8 +268,6 @@ async fn run_keepalive(
         select! {
             _ = shutdown.recv() => break,
             _ = tick.tick() => {
-                // Keepalive payload: 4-byte frag header (seq=0, total=1) + 0 bytes of QUIC.
-                // The server recognises empty chunk → enqueues slot, doesn't inject to quinn.
                 let frag_id: u16 = rand::thread_rng().gen();
                 let payload = [
                     (frag_id >> 8) as u8,
@@ -272,12 +276,20 @@ async fn run_keepalive(
                     1u8, // total = 1
                 ];
                 if let Ok(q) = encode_dns_query(&payload, &domain) {
-                    let _ = dns_sock.send(&q).await;
+                    if let Err(e) = dns_sock.send(&q).await {
+                        // Network down (ENETUNREACH etc.) — back off 2s to avoid
+                        // tight-loop flooding the log and hammering a dead socket.
+                        // When network comes back the next tick will succeed.
+                        debug!(%e, "keepalive: send failed, backing off");
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                    }
                 }
             }
         }
     }
 }
+
+
 
 // ── Loopback socket pair ───────────────────────────────────────────────────────
 
@@ -400,14 +412,23 @@ async fn handle_tcp_connection(tcp: TcpStream, peer: SocketAddr, shared: SharedC
     };
     debug!(%peer, stream = quic_send.id().index(), "QUIC stream opened");
 
+    // ── Bidirectional proxy with hard teardown ────────────────────────────────
+    // We use abort handles so that when one direction fails, we can immediately
+    // cancel the other. Without this, a cancelled download/upload keeps flowing
+    // because the other half keeps running.
     let (mut tcp_rx, mut tcp_tx) = tcp.into_split();
 
+    // TCP → QUIC: read from TCP, write to QUIC stream
     let t2q = tokio::spawn(async move {
         let r = tokio::io::copy(&mut tcp_rx, &mut quic_send).await;
-        let _ = quic_send.finish();
+        match &r {
+            Ok(_) => { let _ = quic_send.finish(); }           // clean EOF → FIN
+            Err(_) => { let _ = quic_send.reset(0u8.into()); } // error → RESET (stops server drain)
+        }
         r
     });
 
+    // QUIC → TCP: read from QUIC stream, write to TCP
     let q2t = tokio::spawn(async move {
         let r = tokio::io::copy(&mut quic_recv, &mut tcp_tx).await;
         let _ = tcp_tx.shutdown().await;
@@ -482,7 +503,7 @@ async fn main() -> Result<()> {
     let dns_sock = Arc::new(dns_sock);
 
     // ── Quinn endpoint ────────────────────────────────────────────────────────
-    let client_config = build_client_config(args.accept_insecure, args.keep_alive_interval)?;
+    let client_config = build_client_config(args.accept_insecure, args.keep_alive_interval, &args.domain)?;
     quinn_std_sock.set_nonblocking(true)?;
     let mut endpoint = Endpoint::new(
         quinn::EndpointConfig::default(),

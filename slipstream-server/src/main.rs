@@ -81,7 +81,7 @@ struct Args {
 
 // ── TLS/QUIC configuration ─────────────────────────────────────────────────────
 
-fn load_tls_config(cert_path: &PathBuf, key_path: &PathBuf) -> Result<ServerConfig> {
+fn load_tls_config(cert_path: &PathBuf, key_path: &PathBuf, domain: &str) -> Result<ServerConfig> {
     let cert_pem = std::fs::read(cert_path)
         .with_context(|| format!("reading cert {}", cert_path.display()))?;
     let key_pem = std::fs::read(key_path)
@@ -96,21 +96,22 @@ fn load_tls_config(cert_path: &PathBuf, key_path: &PathBuf) -> Result<ServerConf
         .context("parsing private key PEM")?
         .context("no private key found")?;
 
-    build_server_config(certs, key)
+    build_server_config(certs, key, domain)
 }
 
-fn self_signed_config() -> Result<ServerConfig> {
+fn self_signed_config(domain: &str) -> Result<ServerConfig> {
     let cert = rcgen::generate_simple_self_signed(vec![SERVER_SNI.to_string()])
         .context("generating self-signed cert")?;
     let cert_der = CertificateDer::from(cert.cert.der().to_vec());
     let key_der = PrivateKeyDer::try_from(cert.key_pair.serialize_der())
         .map_err(|e| anyhow::anyhow!("serializing key: {e}"))?;
-    build_server_config(vec![cert_der], key_der)
+    build_server_config(vec![cert_der], key_der, domain)
 }
 
 fn build_server_config(
     certs: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
+    domain: &str,
 ) -> Result<ServerConfig> {
     let mut tls = rustls::ServerConfig::builder()
         .with_no_client_auth()
@@ -127,39 +128,39 @@ fn build_server_config(
     transport.max_idle_timeout(Some(Duration::from_secs(300).try_into()?));
     transport.keep_alive_interval(Some(Duration::from_millis(400)));
 
-    // ── Congestion control ───────────────────────────────────────────────────
-    // Use BBR instead of NewReno (default). BBR measures bandwidth and RTT
-    // directly rather than reacting to loss, making it much more aggressive
-    // on high-latency links (exactly what DNS tunnels are).
-    // The C code goes further and sets cwin=UINT64_MAX (no CC at all on server),
-    // but quinn doesn't expose that. BBR is the next best option.
+    // ── Congestion control ─────────────────────────────────────────────────
+    // BBR; C code uses cwin=UINT64_MAX (no CC) which quinn doesn't expose.
     transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
 
     // ── Window sizes ─────────────────────────────────────────────────────────
-    // Large windows let QUIC keep many packets in flight simultaneously,
-    // which is essential for high-throughput over high-latency DNS links.
-    transport.send_window(16 * 1024 * 1024);                              // 16 MB
-    transport.receive_window(quinn::VarInt::from_u32(8 * 1024 * 1024));   // 8 MB
-    transport.stream_receive_window(quinn::VarInt::from_u32(4 * 1024 * 1024)); // 4 MB per stream
+    // 512 KB: not the bottleneck for DNS tunnel bandwidth, but won't cause
+    // QUIC to buffer huge amounts of data above what DNS can deliver.
+    transport.send_window(512 * 1024);
+    transport.receive_window(quinn::VarInt::from_u32(512 * 1024));
+    transport.stream_receive_window(quinn::VarInt::from_u32(256 * 1024));
 
-    // ── MTU discovery ────────────────────────────────────────────────────────
-    // We know our effective path MTU (bounded by DNS query size ~512 bytes),
-    // so PMTUD probes would always fail and waste bandwidth. Disable it.
-    transport.mtu_discovery_config(None);
+    // ── MTU: same formula as C code: mtu = (240 - domain_len) / 1.6 ────────
+    // Caps post-handshake QUIC packets to fit in one DNS query. QUIC Initial
+    // packets are still 1200 bytes (RFC 9000 requirement) but data packets
+    // will be small after PMTUD settles to this upper bound.
+    let mtu = ((240.0 - domain.len() as f64) / 1.6) as u16;
+    let mtu = mtu.max(60).min(1200);
+    let mut mtu_cfg = quinn::MtuDiscoveryConfig::default();
+    mtu_cfg.upper_bound(mtu);
+    transport.mtu_discovery_config(Some(mtu_cfg));
 
-    // ── Multiplexing limits ──────────────────────────────────────────────────
-    // Allow many concurrent bidi streams (one per proxied TCP connection).
+    // ── Multiplexing ─────────────────────────────────────────────────────────
     transport.max_concurrent_bidi_streams(quinn::VarInt::from_u32(256));
 
-    // ── Initial RTT estimate ──────────────────────────────────────────────────
-    // DNS tunnel RTTs are typically 200-600ms. A good initial estimate
-    // prevents QUIC from being overly conservative at connection start.
+    // ── Initial RTT estimate ────────────────────────────────────────────────
     transport.initial_rtt(Duration::from_millis(400));
 
     config.transport_config(Arc::new(transport));
 
     Ok(config)
 }
+
+
 
 // ── Loopback socket pair ───────────────────────────────────────────────────────
 
@@ -219,7 +220,7 @@ async fn run_bridge(
     // Outbound QUIC packets from quinn, waiting for a DNS query to carry them.
     // Bounded to avoid unbounded growth; oldest packets dropped if full.
     let mut output_q: VecDeque<Vec<u8>> = VecDeque::new();
-    const MAX_OUTPUT_Q: usize = 128;
+    const MAX_OUTPUT_Q: usize = 16;
 
     loop {
         select! {
@@ -415,13 +416,13 @@ async fn main() -> Result<()> {
     // TLS config
     let server_config = if args.self_signed {
         info!("using auto-generated self-signed certificate");
-        self_signed_config()?
+        self_signed_config(&args.domain)?
     } else {
-        match load_tls_config(&args.cert, &args.key) {
+        match load_tls_config(&args.cert, &args.key, &args.domain) {
             Ok(c) => c,
             Err(e) => {
                 warn!(%e, "cert/key load failed, falling back to self-signed");
-                self_signed_config()?
+                self_signed_config(&args.domain)?
             }
         }
     };
