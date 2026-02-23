@@ -13,7 +13,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use tquic::{Connection, Shutdown, TransportHandler};
+use tquic::{Connection, TransportHandler};
 use tracing::{debug, info, warn};
 
 /// Message from a TCP-forwarder thread back into the TQUIC mio event loop.
