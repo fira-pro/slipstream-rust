@@ -44,7 +44,8 @@ struct Args {
 }
 
 // ── TLS helpers ────────────────────────────────────────────────────────────────
-// TlsConfig::new_server_config(cert_pem: &str, key_pem: &str, alpn: Vec<Vec<u8>>, verify_client: bool)
+// TlsConfig::new_server_config(cert_path: &str, key_path: &str, alpn: Vec<Vec<u8>>, verify_client: bool)
+// Arguments are FILE PATHS to PEM files, not raw PEM content.
 
 fn make_tls_self_signed(domain: &str) -> Result<TlsConfig> {
     let cert = rcgen::generate_simple_self_signed(vec![
@@ -53,12 +54,18 @@ fn make_tls_self_signed(domain: &str) -> Result<TlsConfig> {
     ])
     .context("generating self-signed cert")?;
 
-    let cert_pem = cert.cert.pem();
-    let key_pem  = cert.key_pair.serialize_pem();
+    // TQUIC needs file paths — write to temp files
+    let cert_path = format!("/tmp/slipstream-cert-{}.pem", std::process::id());
+    let key_path  = format!("/tmp/slipstream-key-{}.pem",  std::process::id());
+
+    std::fs::write(&cert_path, cert.cert.pem())
+        .with_context(|| format!("writing cert to {cert_path}"))?;
+    std::fs::write(&key_path, cert.key_pair.serialize_pem())
+        .with_context(|| format!("writing key to {key_path}"))?;
 
     TlsConfig::new_server_config(
-        &cert_pem,
-        &key_pem,
+        &cert_path,
+        &key_path,
         vec![ALPN.to_vec()],
         false, // no client auth
     )
@@ -66,19 +73,15 @@ fn make_tls_self_signed(domain: &str) -> Result<TlsConfig> {
 }
 
 fn make_tls_from_files(cert_path: &PathBuf, key_path: &PathBuf) -> Result<TlsConfig> {
-    let cert_pem = std::fs::read_to_string(cert_path)
-        .with_context(|| format!("reading cert {cert_path:?}"))?;
-    let key_pem  = std::fs::read_to_string(key_path)
-        .with_context(|| format!("reading key {key_path:?}"))?;
-
     TlsConfig::new_server_config(
-        &cert_pem,
-        &key_pem,
+        cert_path.to_str().context("cert path not UTF-8")?,
+        key_path.to_str().context("key path not UTF-8")?,
         vec![ALPN.to_vec()],
         false,
     )
     .context("TlsConfig::new_server_config (from files)")
 }
+
 
 // ── Main ───────────────────────────────────────────────────────────────────────
 
