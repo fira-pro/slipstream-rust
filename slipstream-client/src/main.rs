@@ -89,7 +89,7 @@ async fn handle_tcp(tcp: TcpStream, peer: SocketAddr, tcp_tx: mpsc::SyncSender<T
                         break;
                     }
                 }
-                Err(e) => {
+                Err(_e) => {
                     let _ = tcp_tx2.send(TcpToQuic::Reset { stream_id });
                     break;
                 }

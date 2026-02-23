@@ -9,6 +9,7 @@ use bytes::Bytes;
 use tquic::{Connection, Shutdown, TransportHandler};
 use tracing::{debug, info, warn};
 
+#[allow(dead_code)]
 pub enum QuicToTcp {
     Connected,
     Data    { stream_id: u64, data: Vec<u8> },
@@ -35,14 +36,17 @@ pub struct ClientHandler {
 }
 
 impl ClientHandler {
+    #[allow(dead_code)]
     pub fn new(ctrl_tx: mpsc::SyncSender<QuicToTcp>) -> Self {
         Self { ctrl_tx, streams: HashMap::new() }
     }
 
+    #[allow(dead_code)]
     pub fn register_stream(&mut self, stream_id: u64, reply_tx: mpsc::SyncSender<QuicToTcp>) {
         self.streams.insert(stream_id, StreamState { reply_tx, pending: Vec::new(), fin_pending: false });
     }
 
+    #[allow(dead_code)]
     pub fn tcp_data_to_stream(
         &mut self,
         conn: &mut Connection,

@@ -17,6 +17,7 @@ use tquic::{Connection, Shutdown, TransportHandler};
 use tracing::{debug, info, warn};
 
 /// Message from a TCP-forwarder thread back into the TQUIC mio event loop.
+#[allow(dead_code)]
 pub enum TcpMsg {
     Data { conn_idx: usize, stream_id: u64, data: Vec<u8> },
     Fin  { conn_idx: usize, stream_id: u64 },
@@ -64,12 +65,7 @@ impl ServerHandler {
         idx
     }
 
-    fn stream_write(conn: &mut Connection, stream_id: u64, data: &[u8], fin: bool) {
-        match conn.stream_write(stream_id, Bytes::copy_from_slice(data), fin) {
-            Ok(_) => {}
-            Err(e) => warn!(stream_id, %e, "stream_write error"),
-        }
-    }
+
 }
 
 impl TransportHandler for ServerHandler {
