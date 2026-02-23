@@ -12,6 +12,8 @@ tokio = { version = "1", features = ["full"] }
 
 # QUIC: TQUIC replaces quinn+rustls entirely
 tquic = "1"
+bytes = "1"
+
 
 # mio for the TQUIC event loop
 mio = { version = "1", features = ["net", "os-poll"] }

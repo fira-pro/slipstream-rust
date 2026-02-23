@@ -11,6 +11,7 @@ path = "src/main.rs"
 slipstream-core = { path = "../slipstream-core" }
 tokio   = { workspace = true }
 tquic   = { workspace = true }
+bytes   = { workspace = true }
 mio     = { workspace = true }
 rcgen   = { workspace = true }
 clap    = { workspace = true }
