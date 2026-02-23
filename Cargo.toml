@@ -7,20 +7,28 @@ members = [
 resolver = "2"
 
 [workspace.dependencies]
+# Async runtime (Tokio for TCP accept side only; TQUIC runs on its own mio thread)
 tokio = { version = "1", features = ["full"] }
-quinn = { version = "0.11", features = ["runtime-tokio", "ring"] }
-rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
-rustls-pemfile = "2"
+
+# QUIC: TQUIC replaces quinn+rustls entirely
+tquic = "1"
+
+# mio for the TQUIC event loop
+mio = { version = "1", features = ["net", "os-poll"] }
+
+# TLS certs for --self-signed mode (TQUIC uses its own TLS, we still need rcgen for cert gen)
 rcgen = { version = "0.13", features = ["ring"] }
+
+# DNS codec (unchanged)
 data-encoding = "2"
-clap = { version = "4", features = ["derive"] }
+hickory-proto = "0.24"
+
+# CLI, logging, utils
+clap    = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-rand = "0.8"
-bytes = "1"
-anyhow = "1"
+rand    = "0.8"
+bytes   = "1"
+anyhow  = "1"
 thiserror = "2"
-hickory-proto = "0.24"
-tokio-util = { version = "0.7", features = ["io"] }
-futures = "0.3"
-socket2 = { version = "0.5", features = ["all"] }
+socket2   = { version = "0.5", features = ["all"] }
