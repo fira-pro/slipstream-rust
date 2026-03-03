@@ -51,12 +51,19 @@ impl ClientDnsBridge {
         }
     }
 
-    /// Decode an incoming DNS response from a resolver.
+    /// Decode an incoming DNS response from a resolver → raw QUIC packet.
+    ///
+    /// Server→client direction: one complete QUIC packet per DNS response,
+    /// embedded directly in a TXT record with NO fragmentation header.
+    /// Simply decode and return — no reassembly needed.
     pub fn decode_dns_response(&mut self, wire: &[u8], resolver_idx: usize) -> Option<Vec<u8>> {
         match decode_dns_response(wire) {
-            Ok(Some(data)) => self.try_reassemble(&data, resolver_idx),
+            Ok(Some(data)) => {
+                debug!(resolver_idx, bytes = data.len(), "DNS response: got QUIC data");
+                Some(data)
+            }
             Ok(None) => {
-                trace!(resolver_idx, "NXDOMAIN/empty response (server has no data)");
+                trace!(resolver_idx, "DNS response: NXDOMAIN (server empty)");
                 None
             }
             Err(e) => {
