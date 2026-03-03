@@ -85,6 +85,23 @@ pub fn run(
 
     info!(%dns_bind, "TQUIC server event loop started");
 
+    // Fixed virtual client address used for ALL injected QUIC packets.
+    // External resolvers change src port/IP per query; a constant address
+    // prevents TQUIC from triggering path migration / PATH_CHALLENGE.
+    let virtual_client: SocketAddr = "100.64.0.1:4444".parse().unwrap();
+
+    // Resolve 0.0.0.0 → 127.0.0.1 so TQUIC gets a real unicast dst address.
+    let local_bind: SocketAddr = if dns_bind.ip().is_unspecified() {
+        let ip = if dns_bind.is_ipv6() {
+            std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+        } else {
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+        };
+        SocketAddr::new(ip, dns_bind.port())
+    } else {
+        dns_bind
+    };
+
     let mut events   = Events::with_capacity(256);
     let mut recv_buf = vec![0u8; 4096];
 
@@ -100,10 +117,11 @@ pub fn run(
 
         // ── 1. Drain incoming DNS queries ─────────────────────────────────
         //
-        // CRITICAL ORDER: inject QUIC packet into endpoint FIRST, then
-        // process_connections() to generate Server Hello, THEN pop output_q
-        // and encode the DNS response. This ensures the Server Hello is
-        // available in the response rather than delayed by one round-trip.
+        // KEY: Use a fixed virtual client address for all injected QUIC packets.
+        // External recursive resolvers change their src port/IP between queries,
+        // which TQUIC interprets as path migration (triggers PATH_CHALLENGE frames
+        // that fail, dropping all data). By injecting all packets with the same
+        // virtual src, TQUIC sees a stable single path.
         loop {
             match dns_sock.recv_from(&mut recv_buf) {
                 Ok((n, peer_addr)) => {
@@ -111,23 +129,21 @@ pub fn run(
                     let (raw_query, assembled) =
                         bridge.borrow_mut().decode_query(&recv_buf[..n]);
 
-                    // Step 2: inject QUIC packet into endpoint (generates responses)
+                    // Step 2: inject with FIXED virtual address (not real peer_addr)
                     if let Some(mut quic_pkt) = assembled {
                         let pkt_info = PacketInfo {
-                            src: peer_addr,
-                            dst: dns_bind,
+                            src:  virtual_client,  // ← always the same
+                            dst:  local_bind,       // ← server's real local addr
                             time: Instant::now(),
                         };
                         if let Err(e) = endpoint.recv(&mut quic_pkt, &pkt_info) {
                             debug!(%e, "endpoint.recv error");
                         }
-                        // Drive TQUIC so it generates handshake/data responses NOW
                         let _ = endpoint.process_connections();
                     }
 
-                    // Step 3: pop queued QUIC output and send DNS response
-                    let response =
-                        bridge.borrow_mut().encode_response(&raw_query);
+                    // Step 3: respond to the ACTUAL peer_addr (real resolver IP)
+                    let response = bridge.borrow_mut().encode_response(&raw_query);
                     if !response.is_empty() {
                         if let Err(e) = dns_sock.send_to(&response, peer_addr) {
                             debug!(%e, "DNS send_to failed");
