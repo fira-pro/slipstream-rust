@@ -39,7 +39,7 @@ impl PacketSendHandler for DnsPacketSender {
     }
 }
 
-fn make_server_config(domain: &str, tls_config: TlsConfig) -> Result<Config> {
+fn make_server_config(_domain: &str, tls_config: TlsConfig) -> Result<Config> {
     let mut config = Config::new().context("Config::new")?;
 
     // NOTE: Do NOT set send/recv_udp_payload_size here.

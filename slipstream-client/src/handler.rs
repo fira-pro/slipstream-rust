@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 
 use bytes::Bytes;
-use tquic::{Connection, Shutdown, TransportHandler};
+use tquic::{Connection, TransportHandler};
 use tracing::{debug, info, warn};
 
 /// Messages from TQUIC mio thread → Tokio TCP task (per-stream channel).
@@ -46,9 +46,7 @@ impl ClientHandler {
         Self { ctrl_tx, streams: HashMap::new() }
     }
 
-    pub fn register_stream(&mut self, stream_id: u64, reply_tx: tokio::sync::mpsc::Sender<QuicToTcp>) {
-        self.streams.insert(stream_id, StreamState { reply_tx });
-    }
+
 }
 
 impl TransportHandler for ClientHandler {
@@ -63,7 +61,7 @@ impl TransportHandler for ClientHandler {
 
     fn on_conn_closed(&mut self, _conn: &mut Connection) {
         info!("QUIC client connection closed");
-        for (sid, s) in self.streams.drain() {
+        for (_sid, s) in self.streams.drain() {
             let _ = s.reply_tx.try_send(QuicToTcp::Fin);
         }
     }
