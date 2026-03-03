@@ -89,18 +89,12 @@ impl DnsBridge {
     /// The raw_wire is kept so encode_response() can mirror the DNS transaction ID.
     pub fn decode_query(&mut self, wire: &[u8]) -> (Vec<u8>, Option<Vec<u8>>) {
         let assembled = match decode_dns_query_frag(wire, &self.domain) {
-            Ok((frag_id, seq, total, chunk)) => {
-                tracing::debug!(frag_id, seq, total, chunk_len = chunk.len(), "DNS query fragment");
-                self.reassemble(frag_id, seq, total, chunk)
-            }
+            Ok((frag_id, seq, total, chunk)) => self.reassemble(frag_id, seq, total, chunk),
             Err(e) => {
-                tracing::debug!(%e, "decode_dns_query_frag failed (keepalive or non-tunnel query)");
+                debug!(%e, "decode_dns_query_frag failed — NXDOMAIN");
                 None
             }
         };
-        if let Some(ref pkt) = assembled {
-            tracing::info!(bytes = pkt.len(), "QUIC packet assembled from DNS fragments → inject into TQUIC");
-        }
         (wire.to_vec(), assembled)
     }
 
@@ -108,9 +102,6 @@ impl DnsBridge {
     /// Call AFTER endpoint.recv() + process_connections() so the output_q is populated.
     pub fn encode_response(&mut self, raw_query: &[u8]) -> Vec<u8> {
         let quic_payload = self.output_q.pop_front();
-        if let Some(ref p) = quic_payload {
-            tracing::info!(bytes = p.len(), q_remaining = self.output_q.len(), "Sending QUIC packet back to client via DNS response");
-        }
         let payload_ref: &[u8] = quic_payload.as_deref().unwrap_or(&[]);
         match encode_dns_response(raw_query, payload_ref) {
             Ok(r) => r,

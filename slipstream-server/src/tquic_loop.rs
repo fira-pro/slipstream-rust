@@ -131,14 +131,13 @@ pub fn run(
 
                     // Step 2: inject with FIXED virtual address (not real peer_addr)
                     if let Some(mut quic_pkt) = assembled {
-                        tracing::info!(bytes = quic_pkt.len(), "endpoint.recv QUIC packet");
                         let pkt_info = PacketInfo {
-                            src:  virtual_client,
-                            dst:  local_bind,
+                            src:  virtual_client,  // ← always the same
+                            dst:  local_bind,       // ← server's real local addr
                             time: Instant::now(),
                         };
                         if let Err(e) = endpoint.recv(&mut quic_pkt, &pkt_info) {
-                            tracing::warn!(%e, "endpoint.recv error");
+                            debug!(%e, "endpoint.recv error");
                         }
                         let _ = endpoint.process_connections();
                     }
@@ -170,16 +169,17 @@ pub fn run(
         loop {
             match tcp_rx.try_recv() {
                 Ok(TcpMsg::Data { conn_idx, stream_id, data }) => {
-                    tracing::info!(conn_idx, stream_id, bytes = data.len(), "TCP → QUIC stream_write");
                     if let Some(conn) = endpoint.conn_get_mut(conn_idx as u64) {
                         match conn.stream_write(stream_id, Bytes::from(data), false) {
-                            Ok(n) => tracing::info!(conn_idx, stream_id, n, "stream_write ok"),
-                            Err(tquic::Error::Done) => warn!(conn_idx, stream_id, "stream buffer full"),
+                            Ok(n) => debug!(conn_idx, stream_id, n, "tcp→quic"),
+                            Err(tquic::Error::Done) => {
+                                // Send buffer full — TQUIC will call on_stream_writable
+                                // which drains handler's pending buffer. Just signal want_write.
+                                warn!(conn_idx, stream_id, "stream buffer full");
+                            }
                             Err(e) => warn!(conn_idx, stream_id, %e, "stream_write error"),
                         }
                         let _ = conn.stream_want_write(stream_id, true);
-                    } else {
-                        warn!(conn_idx, "conn_get_mut returned None");
                     }
                 }
                 Ok(TcpMsg::Fin { conn_idx, stream_id }) => {
