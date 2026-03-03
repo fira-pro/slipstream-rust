@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use handler::{QuicToTcp, TcpToQuic};
 use tokio::{
-    io::AsyncReadExt,
+    io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
 };
 use tquic::TlsConfig;
@@ -38,14 +38,10 @@ struct Args {
     log_level: String,
 }
 
-// ── TLS ────────────────────────────────────────────────────────────────────────
-// TlsConfig::new_client_config(alpn: Vec<Vec<u8>>, early_data: bool)
-// tls.set_verify(false) — disables cert verification
-
 fn make_client_tls(accept_insecure: bool) -> Result<TlsConfig> {
     let mut tls = TlsConfig::new_client_config(
         vec![ALPN.to_vec()],
-        false, // no 0-RTT early data
+        false,
     )
     .context("TlsConfig::new_client_config")?;
 
@@ -55,24 +51,34 @@ fn make_client_tls(accept_insecure: bool) -> Result<TlsConfig> {
     Ok(tls)
 }
 
-// ── TCP connection handler (Tokio task) ────────────────────────────────────────
+// ── Per-TCP-connection handler (Tokio task) ────────────────────────────────────
 
 async fn handle_tcp(tcp: TcpStream, peer: SocketAddr, tcp_tx: mpsc::SyncSender<TcpToQuic>) {
     info!(%peer, "TCP connection accepted");
 
-    let (reply_tx, reply_rx) = mpsc::sync_channel::<QuicToTcp>(128);
-    if tcp_tx.send(TcpToQuic::NewStream { reply_tx: reply_tx.clone() }).is_err() {
+    // Request a QUIC bidi stream; the event loop will reply with StreamAssigned.
+    let (reply_tx, mut reply_rx) = tokio::sync::mpsc::channel::<QuicToTcp>(128);
+    if tcp_tx.send(TcpToQuic::NewStream { reply_tx }).is_err() {
         warn!(%peer, "TQUIC event loop gone");
         return;
     }
 
-    // Wait for a stream_id assignment (future work: event loop sends StreamId back)
-    let stream_id: u64 = 0; // placeholder until NewStream→StreamAssigned handshake is wired
+    // Wait for the real stream_id before piping data
+    let stream_id = match reply_rx.recv().await {
+        Some(QuicToTcp::StreamAssigned { stream_id }) => {
+            info!(%peer, stream_id, "QUIC stream assigned");
+            stream_id
+        }
+        _ => {
+            warn!(%peer, "QUIC stream assignment failed");
+            return;
+        }
+    };
 
-    let (mut tcp_r, _tcp_w) = tcp.into_split();
+    let (mut tcp_r, mut tcp_w) = tcp.into_split();
     let tcp_tx2 = tcp_tx.clone();
 
-    // TCP→QUIC task
+    // TCP→QUIC
     let t2q = tokio::spawn(async move {
         let mut buf = vec![0u8; 16 * 1024];
         loop {
@@ -89,7 +95,8 @@ async fn handle_tcp(tcp: TcpStream, peer: SocketAddr, tcp_tx: mpsc::SyncSender<T
                         break;
                     }
                 }
-                Err(_e) => {
+                Err(e) => {
+                    warn!(stream_id, %e, "TCP read error");
                     let _ = tcp_tx2.send(TcpToQuic::Reset { stream_id });
                     break;
                 }
@@ -97,15 +104,27 @@ async fn handle_tcp(tcp: TcpStream, peer: SocketAddr, tcp_tx: mpsc::SyncSender<T
         }
     });
 
-    // QUIC→TCP: handled by the reply_rx channel (future work)
-    // For now, drain reply_rx without writing to avoid blocking
+    // QUIC→TCP
     let q2t = tokio::spawn(async move {
-        // Placeholder — real impl uses tokio::sync::mpsc reply channel
-        drop(reply_rx);
+        loop {
+            match reply_rx.recv().await {
+                Some(QuicToTcp::Data { data }) => {
+                    if let Err(e) = tcp_w.write_all(&data).await {
+                        warn!(stream_id, %e, "TCP write error");
+                        break;
+                    }
+                }
+                Some(QuicToTcp::Fin) | None => {
+                    let _ = tcp_w.shutdown().await;
+                    break;
+                }
+                Some(QuicToTcp::StreamAssigned { .. }) => {} // ignore unexpected
+            }
+        }
     });
 
     let _ = tokio::join!(t2q, q2t);
-    info!(%peer, "TCP connection closed");
+    info!(%peer, stream_id, "TCP connection closed");
 }
 
 // ── Main ───────────────────────────────────────────────────────────────────────
@@ -125,14 +144,13 @@ async fn main() -> Result<()> {
           tcp_port = args.tcp_listen_port, "slipstream-client (TQUIC branch) starting");
 
     let tls_config = make_client_tls(args.accept_insecure)?;
-    let sni        = args.domain.clone();
 
     let (tcp_tx, tcp_rx) = mpsc::sync_channel::<TcpToQuic>(1024);
-    let (ctrl_tx, ctrl_rx) = mpsc::sync_channel::<QuicToTcp>(64);
+    let (ctrl_tx, ctrl_rx) = mpsc::sync_channel::<()>(4);
 
     let loop_args = tquic_loop::LoopArgs {
         resolvers:  args.resolver.clone(),
-        server_sni: sni,
+        server_sni: args.domain.clone(),
         domain:     args.domain.clone(),
         tls_config,
         tcp_rx,
@@ -146,21 +164,17 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Wait for initial QUIC connection
     info!("waiting for QUIC connection...");
     match ctrl_rx.recv() {
-        Ok(QuicToTcp::Connected) => info!("QUIC connection established!"),
-        Ok(QuicToTcp::Disconnected) | Err(_) => {
-            anyhow::bail!("QUIC connection failed on startup");
-        }
-        _ => {}
+        Ok(()) => info!("QUIC connection established!"),
+        Err(_) => anyhow::bail!("QUIC event loop exited before handshake"),
     }
 
     let listen_addr: SocketAddr = format!("127.0.0.1:{}", args.tcp_listen_port).parse().unwrap();
     let listener = TcpListener::bind(listen_addr)
         .await
         .with_context(|| format!("binding TCP on {listen_addr}"))?;
-    info!(%listen_addr, "TCP proxy listening");
+    info!(%listen_addr, "TCP proxy listening — connect your apps here");
 
     loop {
         match listener.accept().await {
