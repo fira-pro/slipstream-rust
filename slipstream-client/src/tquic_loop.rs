@@ -128,9 +128,12 @@ pub fn run(args: LoopArgs) -> Result<()> {
         let socks = unsafe { &*(Rc::as_ptr(&sockets) as *const Vec<MioUdpSocket>) };
         socks[0].local_addr()?
     };
-    let dummy_server: SocketAddr = "1.2.3.4:4444".parse().unwrap();
+    // Connect to actual resolver[0] as the QUIC peer — NOT a dummy address.
+    // TQUIC encodes the peer addr into INITIAL packet transport params;
+    // using a fake address causes TransportParameterError on the server.
     let conn_id = endpoint.connect(
-        local_addr, dummy_server,
+        local_addr,
+        args.resolvers[0],      // ← real resolver address
         Some(&args.server_sni),
         None, None, None,
     ).context("endpoint.connect")?;

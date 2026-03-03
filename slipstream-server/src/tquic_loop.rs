@@ -17,7 +17,7 @@ use std::{
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use mio::{Events, Interest, Poll, Token, net::UdpSocket as MioUdpSocket};
-use tquic::{Config, CongestionControlAlgorithm, Endpoint, PacketInfo, PacketSendHandler, Shutdown, TlsConfig};
+use tquic::{Config, CongestionControlAlgorithm, Endpoint, PacketInfo, PacketSendHandler, TlsConfig};
 use tracing::{debug, info, warn};
 
 use crate::dns_bridge::DnsBridge;
@@ -98,18 +98,20 @@ pub fn run(
         endpoint.on_timeout(Instant::now());
         endpoint.process_connections()?;
 
-        // ── 1. Drain incoming DNS queries ─────────────────────────────────────
+        // ── 1. Drain incoming DNS queries ─────────────────────────────────
+        //
+        // CRITICAL ORDER: inject QUIC packet into endpoint FIRST, then
+        // process_connections() to generate Server Hello, THEN pop output_q
+        // and encode the DNS response. This ensures the Server Hello is
+        // available in the response rather than delayed by one round-trip.
         loop {
             match dns_sock.recv_from(&mut recv_buf) {
                 Ok((n, peer_addr)) => {
-                    let (response, assembled) = bridge.borrow_mut().handle_query(&recv_buf[..n]);
+                    // Step 1: decode DNS query → extract QUIC payload
+                    let (raw_query, assembled) =
+                        bridge.borrow_mut().decode_query(&recv_buf[..n]);
 
-                    if !response.is_empty() {
-                        if let Err(e) = dns_sock.send_to(&response, peer_addr) {
-                            debug!(%e, "DNS send_to failed");
-                        }
-                    }
-
+                    // Step 2: inject QUIC packet into endpoint (generates responses)
                     if let Some(mut quic_pkt) = assembled {
                         let pkt_info = PacketInfo {
                             src: peer_addr,
@@ -118,6 +120,17 @@ pub fn run(
                         };
                         if let Err(e) = endpoint.recv(&mut quic_pkt, &pkt_info) {
                             debug!(%e, "endpoint.recv error");
+                        }
+                        // Drive TQUIC so it generates handshake/data responses NOW
+                        let _ = endpoint.process_connections();
+                    }
+
+                    // Step 3: pop queued QUIC output and send DNS response
+                    let response =
+                        bridge.borrow_mut().encode_response(&raw_query);
+                    if !response.is_empty() {
+                        if let Err(e) = dns_sock.send_to(&response, peer_addr) {
+                            debug!(%e, "DNS send_to failed");
                         }
                     }
                 }

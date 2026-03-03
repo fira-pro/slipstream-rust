@@ -84,6 +84,30 @@ impl DnsBridge {
         (response, assembled)
     }
 
+    /// Step 1 of the split API: decode DNS query → return (raw_wire, reassembled_quic_packet).
+    /// The raw_wire is kept so encode_response() can mirror the DNS transaction ID.
+    pub fn decode_query(&mut self, wire: &[u8]) -> (Vec<u8>, Option<Vec<u8>>) {
+        let assembled = match decode_dns_query_frag(wire, &self.domain) {
+            Ok((frag_id, seq, total, chunk)) => self.reassemble(frag_id, seq, total, chunk),
+            Err(e) => {
+                debug!(%e, "decode_dns_query_frag failed — NXDOMAIN");
+                None
+            }
+        };
+        (wire.to_vec(), assembled)
+    }
+
+    /// Step 2 of the split API: pop queued QUIC output and encode a DNS response.
+    /// Call AFTER endpoint.recv() + process_connections() so the output_q is populated.
+    pub fn encode_response(&mut self, raw_query: &[u8]) -> Vec<u8> {
+        let quic_payload = self.output_q.pop_front();
+        let payload_ref: &[u8] = quic_payload.as_deref().unwrap_or(&[]);
+        match encode_dns_response(raw_query, payload_ref) {
+            Ok(r) => r,
+            Err(e) => { warn!(%e, "encode_dns_response failed"); Vec::new() }
+        }
+    }
+
     fn reassemble(&mut self, frag_id: u16, seq: u8, total: u8, chunk: Vec<u8>) -> Option<Vec<u8>> {
         if total == 0 {
             // Keepalive / empty poll — no data
