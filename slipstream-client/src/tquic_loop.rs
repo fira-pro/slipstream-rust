@@ -52,11 +52,9 @@ impl PacketSendHandler for DnsPacketSender {
 fn make_client_config(domain: &str, resolvers: &[SocketAddr], tls_config: TlsConfig) -> Result<Config> {
     let mut config = Config::new().context("Config::new")?;
 
-    let mtu = ((240.0 - domain.len() as f64) / 1.6) as usize;
-    let mtu = mtu.max(60).min(1200);
-    config.set_send_udp_payload_size(mtu);
-    config.set_recv_udp_payload_size(mtu as u16);
-    config.enable_dplpmtud(false);
+    // NOTE: Do NOT set send/recv_udp_payload_size here.
+    // QUIC uses standard >=1200 byte packets; DNS fragmentation is transparent.
+    // Setting max_udp_payload_size < 1200 violates RFC 9000 -> TransportParameterError.
 
     if resolvers.len() > 1 {
         config.enable_multipath(true);

@@ -42,11 +42,11 @@ impl PacketSendHandler for DnsPacketSender {
 fn make_server_config(domain: &str, tls_config: TlsConfig) -> Result<Config> {
     let mut config = Config::new().context("Config::new")?;
 
-    let mtu = ((240.0 - domain.len() as f64) / 1.6) as usize;
-    let mtu = mtu.max(60).min(1200);
-    config.set_send_udp_payload_size(mtu);
-    config.set_recv_udp_payload_size(mtu as u16);
-    config.enable_dplpmtud(false);
+    // NOTE: Do NOT set send/recv_udp_payload_size here.
+    // QUIC must use standard >=1200 byte packets per RFC 9000.
+    // DNS fragmentation is transparent — the bridge fragments/reassembles
+    // 1200-byte QUIC packets into small DNS queries invisibly.
+    // Setting max_udp_payload_size < 1200 violates RFC 9000 -> TransportParameterError.
 
     config.set_congestion_control_algorithm(CongestionControlAlgorithm::Copa);
     config.set_initial_congestion_window(64);

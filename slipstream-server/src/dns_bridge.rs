@@ -56,6 +56,7 @@ impl DnsBridge {
     /// Returns:
     /// - `response_wire` — DNS wire bytes to send back to `src` (always present)
     /// - `Option<Vec<u8>>` — fully reassembled QUIC packet to inject into TQUIC
+    #[allow(dead_code)]
     pub fn handle_query(&mut self, wire: &[u8]) -> (Vec<u8>, Option<Vec<u8>>) {
         // 1. Decode and reassemble.
         let assembled = match decode_dns_query_frag(wire, &self.domain) {
