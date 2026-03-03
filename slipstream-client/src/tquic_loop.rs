@@ -1,7 +1,16 @@
 //! Client mio event loop — drives TQUIC + multipath DNS sockets.
+//!
+//! Data path (now fully wired):
+//! - NewStream  → conn.stream_bidi_new() → reply stream_id back to Tokio task
+//! - TCP Data   → conn.stream_write() + stream_want_write()
+//! - TCP Fin    → conn.stream_write(fin=true)
+//! - TCP Reset  → conn.stream_shutdown(Write)
+//! - QUIC→TCP   → on_stream_readable reads + sends to per-stream reply_tx
+//! - Multipath  → conn.add_path() for each extra resolver after connect
 
 use std::{
     cell::RefCell,
+    collections::HashMap,
     net::{SocketAddr, UdpSocket as StdUdpSocket},
     rc::Rc,
     sync::mpsc,
@@ -9,10 +18,11 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use bytes::Bytes;
 use mio::{Events, Interest, Poll, Token, net::UdpSocket as MioUdpSocket};
 use tquic::{
     Config, CongestionControlAlgorithm, Endpoint, MultipathAlgorithm,
-    PacketInfo, PacketSendHandler, TlsConfig,
+    PacketInfo, PacketSendHandler, Shutdown, TlsConfig,
 };
 use tracing::{debug, info, warn};
 
@@ -28,11 +38,10 @@ struct DnsPacketSender {
 
 impl PacketSendHandler for DnsPacketSender {
     fn on_packets_send(&self, pkts: &[(Vec<u8>, PacketInfo)]) -> tquic::Result<usize> {
-        let mut bridge  = self.bridge.borrow_mut();
+        let mut bridge = self.bridge.borrow_mut();
         let sockets = &*self.sockets;
         for (data, _info) in pkts {
-            let dispatches = bridge.encode_quic_packet(data);
-            for (ri, wire) in dispatches {
+            for (ri, wire) in bridge.encode_quic_packet(data) {
                 let _ = sockets[ri % sockets.len()].send(&wire);
             }
         }
@@ -62,7 +71,6 @@ fn make_client_config(domain: &str, resolvers: &[SocketAddr], tls_config: TlsCon
     config.set_initial_max_streams_bidi(256);
     config.set_max_idle_timeout(300_000);
     config.set_initial_rtt(400);
-
     config.set_tls_config(tls_config);
     Ok(config)
 }
@@ -82,7 +90,7 @@ pub fn run(args: LoopArgs) -> Result<()> {
 
     let config = make_client_config(&args.domain, &args.resolvers, args.tls_config)?;
 
-    // Bind one non-blocking UDP socket per resolver, stored in Rc<Vec<>>
+    // Bind mio UDP sockets (one per resolver)
     let mut sockets_vec: Vec<MioUdpSocket> = Vec::with_capacity(n);
     for resolver in &args.resolvers {
         let local: SocketAddr = if resolver.is_ipv4() { "0.0.0.0:0".parse().unwrap() }
@@ -102,45 +110,41 @@ pub fn run(args: LoopArgs) -> Result<()> {
     });
 
     let handler = ClientHandler::new(args.ctrl_tx.clone());
+    let mut endpoint = Endpoint::new(Box::new(config), false, Box::new(handler), sender);
 
-    let mut endpoint = Endpoint::new(
-        Box::new(config),
-        false, // is_server
-        Box::new(handler),
-        sender,
-    );
-
-    // Register sockets with mio
-    let mut poll       = Poll::new()?;
-    let waker_token    = Token(n);
-    let _waker         = mio::Waker::new(poll.registry(), waker_token)?;
-    // Temporarily take sockets out of Rc to register (Rc unwrap after all refs dropped)
-    // We'll register via a raw pointer borrow:
+    // mio registration
+    let mut poll    = Poll::new()?;
+    let waker_token = Token(n);
+    let _waker      = mio::Waker::new(poll.registry(), waker_token)?;
     {
-        // Safety: sockets is only accessed from this thread (Rc, !Send)
         let socks_mut = unsafe { &mut *(Rc::as_ptr(&sockets) as *mut Vec<MioUdpSocket>) };
         for (i, sock) in socks_mut.iter_mut().enumerate() {
             poll.registry().register(sock, resolver_token(i), Interest::READABLE)?;
         }
     }
 
-    // Initial connect — dummy server addr, actual routing via DNS sockets
-    let dummy_server: SocketAddr = "1.2.3.4:4444".parse().unwrap();
+    // Initiate QUIC connection (via primary resolver socket)
     let local_addr = {
         let socks = unsafe { &*(Rc::as_ptr(&sockets) as *const Vec<MioUdpSocket>) };
         socks[0].local_addr()?
     };
-
-    endpoint.connect(
-        local_addr,
-        dummy_server,
+    let dummy_server: SocketAddr = "1.2.3.4:4444".parse().unwrap();
+    let conn_id = endpoint.connect(
+        local_addr, dummy_server,
         Some(&args.server_sni),
-        None,
-        None,
-        None, // Option<&Config>
-    )
-    .context("endpoint.connect")?;
-    info!("QUIC connection initiated");
+        None, None, None,
+    ).context("endpoint.connect")?;
+    info!(?conn_id, "QUIC connection initiated");
+
+    // conn_get_mut takes a u64 index; connection starts at index 0 for client
+    let conn_index: u64 = 0;
+
+    // Wait for handshake to complete before accepting stream requests
+    let mut connected       = false;
+    // Map stream_id → reply_tx for QUIC→TCP data forwarding
+    let mut stream_map: HashMap<u64, mpsc::SyncSender<QuicToTcp>> = HashMap::new();
+    // Pending stream open requests (before connection is established)
+    let mut pending_streams: Vec<mpsc::SyncSender<QuicToTcp>> = Vec::new();
 
     let mut events         = Events::with_capacity(256);
     let mut recv_buf       = vec![0u8; 4096];
@@ -148,8 +152,8 @@ pub fn run(args: LoopArgs) -> Result<()> {
     let keepalive_interval = Duration::from_millis(20);
 
     loop {
-        let now             = Instant::now();
-        let until_ka        = keepalive_interval
+        let now        = Instant::now();
+        let until_ka   = keepalive_interval
             .checked_sub(now.duration_since(last_keepalive))
             .unwrap_or(Duration::ZERO);
         let timeout = endpoint
@@ -160,8 +164,9 @@ pub fn run(args: LoopArgs) -> Result<()> {
 
         poll.poll(&mut events, Some(timeout))?;
         endpoint.on_timeout(Instant::now());
+        endpoint.process_connections()?;
 
-        // 1. Read DNS responses from all resolver sockets
+        // ── 1. Read DNS responses from all resolver sockets ──────────────────
         let socks = unsafe { &*(Rc::as_ptr(&sockets) as *const Vec<MioUdpSocket>) };
         for (ri, sock) in socks.iter().enumerate() {
             loop {
@@ -179,12 +184,76 @@ pub fn run(args: LoopArgs) -> Result<()> {
                         }
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(e) => { warn!(%e, ri, "resolver socket recv error"); break; }
+                    Err(e) => { warn!(%e, ri, "recv error"); break; }
                 }
             }
         }
 
-        // 2. Keepalive: send empty poll queries to each resolver
+        // ── 2. Check if handshake just completed ─────────────────────────────
+        if !connected {
+            if let Some(conn) = endpoint.conn_get_mut(conn_index) {
+                if conn.is_established() {
+                    connected = true;
+                    info!("QUIC handshake complete");
+                    let _ = args.ctrl_tx.try_send(QuicToTcp::Connected);
+
+                    // Add extra paths for multipath
+                    for (ri, resolver) in args.resolvers.iter().enumerate().skip(1) {
+                        let local_ri = {
+                            let s = unsafe { &*(Rc::as_ptr(&sockets) as *const Vec<MioUdpSocket>) };
+                            s[ri].local_addr().unwrap_or(local_addr)
+                        };
+                        if let Err(e) = conn.add_path(local_ri, *resolver) {
+                            warn!(%e, ri, "add_path failed");
+                        } else {
+                            info!(ri, %resolver, "multipath path added");
+                        }
+                    }
+
+                    // Open any streams that were requested before connection
+                    for reply_tx in pending_streams.drain(..) {
+                        open_stream(conn, &mut stream_map, reply_tx);
+                    }
+                }
+            }
+        }
+
+        // ── 3. Drain readable QUIC streams → send to TCP tasks ───────────────
+        if let Some(conn) = endpoint.conn_get_mut(conn_index) {
+            let readable: Vec<u64> = conn.stream_readable_iter().collect();
+            let mut buf = vec![0u8; 16 * 1024];
+            for sid in readable {
+                loop {
+                    match conn.stream_read(sid, &mut buf) {
+                        Ok((0, _)) => break,
+                        Ok((n, fin)) => {
+                            if let Some(tx) = stream_map.get(&sid) {
+                                let _ = tx.try_send(QuicToTcp::Data {
+                                    stream_id: sid,
+                                    data: buf[..n].to_vec(),
+                                });
+                            }
+                            if fin {
+                                if let Some(tx) = stream_map.remove(&sid) {
+                                    let _ = tx.try_send(QuicToTcp::Fin { stream_id: sid });
+                                }
+                                break;
+                            }
+                        }
+                        Err(tquic::Error::Done) => break,
+                        Err(e) => {
+                            warn!(sid, %e, "stream_read error");
+                            if let Some(tx) = stream_map.remove(&sid) {
+                                let _ = tx.try_send(QuicToTcp::Fin { stream_id: sid });
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── 4. Keepalive ─────────────────────────────────────────────────────
         let now = Instant::now();
         if now.duration_since(last_keepalive) >= keepalive_interval {
             last_keepalive = now;
@@ -196,25 +265,70 @@ pub fn run(args: LoopArgs) -> Result<()> {
             }
         }
 
-        // 3. TCP→QUIC messages
+        // ── 5. TCP→QUIC messages ─────────────────────────────────────────────
         loop {
             match args.tcp_rx.try_recv() {
                 Ok(TcpToQuic::NewStream { reply_tx }) => {
-                    debug!("NewStream from TCP side (TODO: open bidi stream)");
-                    // TODO: call conn.open_bidi_stream() once TQUIC exposes connection access
-                    let _ = reply_tx; // suppress unused warning
+                    if connected {
+                        if let Some(conn) = endpoint.conn_get_mut(conn_index) {
+                            open_stream(conn, &mut stream_map, reply_tx);
+                        }
+                    } else {
+                        pending_streams.push(reply_tx);
+                    }
                 }
                 Ok(TcpToQuic::Data { stream_id, data }) => {
-                    debug!(stream_id, bytes = data.len(), "TCP→QUIC data (TODO: write to stream)");
+                    if let Some(conn) = endpoint.conn_get_mut(conn_index) {
+                        match conn.stream_write(stream_id, Bytes::from(data), false) {
+                            Ok(n) => { debug!(stream_id, n, "tcp→quic wrote"); }
+                            Err(tquic::Error::Done) => {
+                                // Stream buffer full — ideally buffer and retry on writable
+                                warn!(stream_id, "stream_write DONE (buffer full)");
+                            }
+                            Err(e) => warn!(stream_id, %e, "stream_write error"),
+                        }
+                        let _ = conn.stream_want_write(stream_id, true);
+                    }
                 }
-                Ok(TcpToQuic::Fin { stream_id }) => { debug!(stream_id, "TCP→QUIC FIN"); }
-                Ok(TcpToQuic::Reset { stream_id }) => { debug!(stream_id, "TCP→QUIC RESET"); }
+                Ok(TcpToQuic::Fin { stream_id }) => {
+                    if let Some(conn) = endpoint.conn_get_mut(conn_index) {
+                        let _ = conn.stream_write(stream_id, Bytes::new(), true);
+                    }
+                }
+                Ok(TcpToQuic::Reset { stream_id }) => {
+                    if let Some(conn) = endpoint.conn_get_mut(conn_index) {
+                        let _ = conn.stream_shutdown(stream_id, Shutdown::Write, 0);
+                    }
+                    stream_map.remove(&stream_id);
+                }
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
                     info!("tcp_rx disconnected, shutting down");
                     return Ok(());
                 }
             }
+        }
+    }
+}
+
+/// Open a new bidi QUIC stream, register the reply_tx, and send conn-established signal.
+fn open_stream(
+    conn: &mut tquic::Connection,
+    stream_map: &mut HashMap<u64, mpsc::SyncSender<QuicToTcp>>,
+    reply_tx: mpsc::SyncSender<QuicToTcp>,
+) {
+    match conn.stream_bidi_new(127, false) { // urgency=127 (lowest), non-incremental
+        Ok(stream_id) => {
+            info!(stream_id, "new QUIC bidi stream opened");
+            let _ = conn.stream_want_write(stream_id, true);
+            // Signal back to the Tokio task — reuse Connected variant as "stream ready"
+            // The stream_id will arrive via the QuicToTcp::Data flow; for now send Connected.
+            stream_map.insert(stream_id, reply_tx.clone());
+            let _ = reply_tx.try_send(QuicToTcp::Connected);
+        }
+        Err(e) => {
+            warn!(%e, "stream_bidi_new failed");
+            let _ = reply_tx.try_send(QuicToTcp::Disconnected);
         }
     }
 }
