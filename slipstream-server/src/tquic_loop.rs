@@ -139,10 +139,16 @@ pub fn run(
                         if let Err(e) = endpoint.recv(&mut quic_pkt, &pkt_info) {
                             debug!(%e, "endpoint.recv error");
                         }
-                        let _ = endpoint.process_connections();
                     }
 
-                    // Step 3: respond to the ACTUAL peer_addr (real resolver IP)
+                    // Step 3: flush TQUIC send path BEFORE building the response.
+                    // This is critical: for keepalive/poll queries (assembled=None)
+                    // we still need to flush any TCP→QUIC data that was written
+                    // since the last recv so it appears in output_q and gets
+                    // returned to the client in this DNS response.
+                    let _ = endpoint.process_connections();
+
+                    // Step 4: respond to the ACTUAL peer_addr (real resolver IP)
                     let response = bridge.borrow_mut().encode_response(&raw_query);
                     if !response.is_empty() {
                         if let Err(e) = dns_sock.send_to(&response, peer_addr) {
@@ -166,9 +172,11 @@ pub fn run(
         // For the event loop we expose get_conn_index_for() via the conn_ptr stored
         // in the handler — but the simplest approach is to track conn_idx here
         // by wrapping in a shared map.
+        let mut tcp_msgs_drained = false;
         loop {
             match tcp_rx.try_recv() {
                 Ok(TcpMsg::Data { conn_idx, stream_id, data }) => {
+                    tcp_msgs_drained = true;
                     if let Some(conn) = endpoint.conn_get_mut(conn_idx as u64) {
                         match conn.stream_write(stream_id, Bytes::from(data), false) {
                             Ok(n) => debug!(conn_idx, stream_id, n, "tcp→quic"),
@@ -183,6 +191,7 @@ pub fn run(
                     }
                 }
                 Ok(TcpMsg::Fin { conn_idx, stream_id }) => {
+                    tcp_msgs_drained = true;
                     if let Some(conn) = endpoint.conn_get_mut(conn_idx as u64) {
                         let _ = conn.stream_write(stream_id, Bytes::new(), true);
                     }
@@ -193,6 +202,13 @@ pub fn run(
                     return Ok(());
                 }
             }
+        }
+        // Flush any stream data written above into output_q so the next
+        // incoming DNS query (or keepalive) can carry it back to the client.
+        // Without this, data sits in TQUIC's send buffer until the next
+        // mio-loop iteration's on_timeout / process_connections call.
+        if tcp_msgs_drained {
+            let _ = endpoint.process_connections();
         }
     }
 }

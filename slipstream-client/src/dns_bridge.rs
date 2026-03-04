@@ -45,7 +45,7 @@ impl ClientDnsBridge {
         let mut payload  = Vec::with_capacity(4);
         payload.extend_from_slice(&frag_id.to_be_bytes());
         payload.push(0); // seq = 0
-        payload.push(1); // total = 1 (single empty fragment)
+        payload.push(0); // total = 0 → server reassemble() returns None (pure poll)
         match encode_dns_query(&payload, &self.domain) {
             Ok(wire) => Some((resolver_idx, wire)),
             Err(e)   => { warn!(%e, "encode_keepalive failed"); None }

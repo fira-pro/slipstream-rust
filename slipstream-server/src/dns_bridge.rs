@@ -17,7 +17,9 @@ use slipstream_core::{decode_dns_query_frag, encode_dns_response};
 use tracing::{debug, warn};
 
 /// Maximum outbound QUIC packets buffered before oldest is dropped.
-pub const MAX_Q: usize = 16;
+/// Must be large enough to absorb the QUIC handshake burst (Server Hello,
+/// cert chain, Finished, ACKs) without dropping packets.
+pub const MAX_Q: usize = 256;
 
 pub struct DnsBridge {
     /// Outbound QUIC packets waiting for a DNS query to carry them.
