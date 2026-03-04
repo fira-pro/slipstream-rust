@@ -75,7 +75,7 @@ pub struct LoopArgs {
     pub ctrl_tx:    std::sync::mpsc::SyncSender<()>,
 }
 
-pub fn run(args: LoopArgs) -> Result<()> {
+pub fn run(mut args: LoopArgs) -> Result<()> {
     let n = args.resolvers.len();
     assert!(n > 0, "at least one resolver required");
 

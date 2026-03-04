@@ -5,9 +5,8 @@
 
 use std::collections::HashMap;
 
-use bytes::Bytes;
 use tquic::{Connection, TransportHandler};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 /// Messages from TQUIC mio thread → Tokio TCP task (per-stream channel).
 #[derive(Debug)]
