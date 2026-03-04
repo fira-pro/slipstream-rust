@@ -56,9 +56,9 @@ fn make_server_config(_domain: &str, tls_config: TlsConfig) -> Result<Config> {
 
     config.set_congestion_control_algorithm(CongestionControlAlgorithm::Copa);
     config.set_initial_congestion_window(64);
-    config.set_initial_max_data(512 * 1024);
-    config.set_initial_max_stream_data_bidi_remote(256 * 1024);
-    config.set_initial_max_stream_data_bidi_local(256 * 1024);
+    config.set_initial_max_data(128 * 1024 * 1024);           // 128 MB connection window
+    config.set_initial_max_stream_data_bidi_remote(16 * 1024 * 1024); // 16 MB per stream (client→server)
+    config.set_initial_max_stream_data_bidi_local(16 * 1024 * 1024);  // 16 MB per stream (server→client)
     config.set_initial_max_streams_bidi(256);
     config.set_max_idle_timeout(300_000);
     config.set_initial_rtt(400);

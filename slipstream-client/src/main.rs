@@ -77,6 +77,7 @@ async fn handle_tcp(tcp: TcpStream, peer: SocketAddr, tcp_tx: mpsc::SyncSender<T
 
     let (mut tcp_r, mut tcp_w) = tcp.into_split();
     let tcp_tx2 = tcp_tx.clone();
+    let tcp_tx3 = tcp_tx.clone(); // for q2t broken-pipe reset
 
     // TCP→QUIC
     let t2q = tokio::spawn(async move {
@@ -104,13 +105,16 @@ async fn handle_tcp(tcp: TcpStream, peer: SocketAddr, tcp_tx: mpsc::SyncSender<T
         }
     });
 
-    // QUIC→TCP
+    // QUIC→TCP: must send Reset on broken-pipe so the server stops streaming
     let q2t = tokio::spawn(async move {
         loop {
             match reply_rx.recv().await {
                 Some(QuicToTcp::Data { data }) => {
                     if let Err(e) = tcp_w.write_all(&data).await {
                         warn!(stream_id, %e, "TCP write error");
+                        // Critical: tell the event loop to send RST_STREAM + STOP_SENDING
+                        // so the server stops sending and teardown completes promptly.
+                        let _ = tcp_tx3.send(TcpToQuic::Reset { stream_id });
                         break;
                     }
                 }
@@ -118,7 +122,7 @@ async fn handle_tcp(tcp: TcpStream, peer: SocketAddr, tcp_tx: mpsc::SyncSender<T
                     let _ = tcp_w.shutdown().await;
                     break;
                 }
-                Some(QuicToTcp::StreamAssigned { .. }) => {} // ignore unexpected
+                Some(QuicToTcp::StreamAssigned { .. }) => {} // ignore
             }
         }
     });
@@ -170,7 +174,7 @@ async fn main() -> Result<()> {
         Err(_) => anyhow::bail!("QUIC event loop exited before handshake"),
     }
 
-    let listen_addr: SocketAddr = format!("127.0.0.1:{}", args.tcp_listen_port).parse().unwrap();
+    let listen_addr: SocketAddr = format!("0.0.0.0:{}", args.tcp_listen_port).parse().unwrap();
     let listener = TcpListener::bind(listen_addr)
         .await
         .with_context(|| format!("binding TCP on {listen_addr}"))?;

@@ -52,9 +52,9 @@ fn make_client_config(resolvers: &[SocketAddr], tls_config: TlsConfig) -> Result
     }
 
     config.set_congestion_control_algorithm(CongestionControlAlgorithm::Bbr);
-    config.set_initial_max_data(10 * 1024 * 1024);
-    config.set_initial_max_stream_data_bidi_local(1 * 1024 * 1024);
-    config.set_initial_max_stream_data_bidi_remote(1 * 1024 * 1024);
+    config.set_initial_max_data(128 * 1024 * 1024);           // 128 MB connection window
+    config.set_initial_max_stream_data_bidi_local(16 * 1024 * 1024);  // 16 MB (client→server)
+    config.set_initial_max_stream_data_bidi_remote(16 * 1024 * 1024); // 16 MB (server→client)
     config.set_initial_max_streams_bidi(256);
     config.set_max_idle_timeout(300_000);
     config.set_initial_rtt(500);

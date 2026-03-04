@@ -35,12 +35,12 @@ pub type TcpRx = mpsc::Receiver<TcpMsg>;
 
 struct StreamState {
     /// Send QUIC→TCP data to the TCP writer thread.
-    qtx: mpsc::SyncSender<Vec<u8>>,
-    /// Pending TCP→QUIC data waiting to be flushed to the QUIC stream when
-    /// the stream's flow-control window opens (stream_write returned Done).
+    /// Unbounded so the mio event loop never blocks and never drops data.
+    /// Backpressure comes from TQUIC's per-stream flow-control window.
+    qtx: mpsc::Sender<Vec<u8>>,
+    /// Pending TCP→QUIC data (buffered when stream_write returns Done).
     pending: Vec<u8>,
-    /// Shared handle to the upstream TcpStream.  on_stream_closed calls
-    /// shutdown(Both) through this so the reader thread's read() returns.
+    /// For interrupting the reader thread on stream close.
     tcp_shutdown: Arc<Mutex<Option<TcpStream>>>,
 }
 
@@ -108,7 +108,7 @@ impl TransportHandler for ServerHandler {
         let conn_idx = self.conn_idx(conn);
         debug!(conn_idx, stream_id, "QUIC stream created → spawning TCP forwarder");
 
-        let (qtx, qrx) = mpsc::sync_channel::<Vec<u8>>(64);
+        let (qtx, qrx) = mpsc::channel::<Vec<u8>>();  // unbounded — no data loss
 
         // Shared slot: the spawned thread fills this with the live TcpStream
         // clone once connect() succeeds. on_stream_closed uses it to interrupt
@@ -195,7 +195,9 @@ impl TransportHandler for ServerHandler {
                 Ok((0, _))    => break,
                 Ok((n, fin))  => {
                     if let Some(s) = self.streams.get(&key) {
-                        let _ = s.qtx.try_send(buf[..n].to_vec());
+                        // send() on unbounded channel never blocks and never fails
+                        // unless the writer thread has exited (channel disconnected).
+                        let _ = s.qtx.send(buf[..n].to_vec());
                     }
                     if fin { self.streams.remove(&key); break; }
                 }
