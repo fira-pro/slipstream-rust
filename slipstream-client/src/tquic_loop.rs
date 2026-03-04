@@ -277,7 +277,10 @@ pub fn run(args: LoopArgs) -> Result<()> {
                 }
                 Ok(TcpToQuic::Reset { stream_id }) => {
                     if let Some(conn) = endpoint.conn_get_mut(conn_index) {
+                        // RST_STREAM: stop sending client→server
                         let _ = conn.stream_shutdown(stream_id, Shutdown::Write, 0);
+                        // STOP_SENDING: ask server to stop sending server→client
+                        let _ = conn.stream_shutdown(stream_id, Shutdown::Read, 0);
                     }
                     stream_map.remove(&stream_id);
                     pending_writes.remove(&stream_id);

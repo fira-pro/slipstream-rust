@@ -8,6 +8,7 @@
 
 use std::{
     cell::RefCell,
+    collections::HashMap,
     net::{SocketAddr, UdpSocket as StdUdpSocket},
     rc::Rc,
     sync::mpsc,
@@ -109,6 +110,10 @@ pub fn run(
 
     let mut events   = Events::with_capacity(256);
     let mut recv_buf = vec![0u8; 4096];
+    // server_pending: data that couldn't be written to a QUIC stream because
+    // the stream's flow-control window was full (stream_write returned Done).
+    // Retried each mio loop iteration and via on_stream_writable.
+    let mut server_pending: HashMap<(usize, u64), Vec<u8>> = HashMap::new();
 
     loop {
         let timeout = endpoint
@@ -183,20 +188,34 @@ pub fn run(
                 Ok(TcpMsg::Data { conn_idx, stream_id, data }) => {
                     tcp_msgs_drained = true;
                     if let Some(conn) = endpoint.conn_get_mut(conn_idx as u64) {
-                        match conn.stream_write(stream_id, Bytes::from(data), false) {
+                        // Prepend any previously un-sent bytes for this stream.
+                        let payload = if let Some(mut prev) = server_pending.remove(&(conn_idx, stream_id)) {
+                            prev.extend_from_slice(&data);
+                            prev
+                        } else {
+                            data
+                        };
+                        match conn.stream_write(stream_id, Bytes::copy_from_slice(&payload), false) {
+                            Ok(n) if n < payload.len() => {
+                                // Partial write — save remainder.
+                                server_pending.insert((conn_idx, stream_id), payload[n..].to_vec());
+                                let _ = conn.stream_want_write(stream_id, true);
+                                debug!(conn_idx, stream_id, n, total = payload.len(), "tcp→quic partial");
+                            }
                             Ok(n) => debug!(conn_idx, stream_id, n, "tcp→quic"),
                             Err(tquic::Error::Done) => {
-                                // Send buffer full — TQUIC will call on_stream_writable
-                                // which drains handler's pending buffer. Just signal want_write.
-                                warn!(conn_idx, stream_id, "stream buffer full");
+                                // Flow-control window full — buffer for retry.
+                                debug!(conn_idx, stream_id, "stream window full, buffering");
+                                server_pending.insert((conn_idx, stream_id), payload);
+                                let _ = conn.stream_want_write(stream_id, true);
                             }
-                            Err(e) => warn!(conn_idx, stream_id, %e, "stream_write error"),
+                            Err(e) => debug!(conn_idx, stream_id, %e, "stream_write error (stream closed?)"),
                         }
-                        let _ = conn.stream_want_write(stream_id, true);
                     }
                 }
                 Ok(TcpMsg::Fin { conn_idx, stream_id }) => {
                     tcp_msgs_drained = true;
+                    server_pending.remove(&(conn_idx, stream_id));
                     if let Some(conn) = endpoint.conn_get_mut(conn_idx as u64) {
                         let _ = conn.stream_write(stream_id, Bytes::new(), true);
                     }
@@ -208,6 +227,30 @@ pub fn run(
                 }
             }
         }
+        // Retry buffered data for streams whose window re-opened.
+        if !server_pending.is_empty() {
+            let pending_keys: Vec<(usize, u64)> = server_pending.keys().cloned().collect();
+            for (ci, sid) in pending_keys {
+                if let Some(data) = server_pending.remove(&(ci, sid)) {
+                    if let Some(conn) = endpoint.conn_get_mut(ci as u64) {
+                        match conn.stream_write(sid, Bytes::copy_from_slice(&data), false) {
+                            Ok(n) if n < data.len() => {
+                                server_pending.insert((ci, sid), data[n..].to_vec());
+                                let _ = conn.stream_want_write(sid, true);
+                            }
+                            Ok(_) => {}
+                            Err(tquic::Error::Done) => {
+                                server_pending.insert((ci, sid), data);
+                                let _ = conn.stream_want_write(sid, true);
+                            }
+                            Err(_) => {} // stream closed — discard
+                        }
+                    }
+                    // conn gone → stream closed; discard buffered data
+                }
+            }
+        }
+
         // Flush any stream data written above into output_q so the next
         // incoming DNS query (or keepalive) can carry it back to the client.
         // Without this, data sits in TQUIC's send buffer until the next
