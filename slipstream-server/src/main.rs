@@ -4,15 +4,33 @@ mod dns_bridge;
 mod handler;
 mod tquic_loop;
 
-use std::{net::SocketAddr, path::PathBuf, sync::mpsc};
+use std::{net::SocketAddr, path::PathBuf};
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use handler::{TcpRx, TcpTx};
-use tquic::TlsConfig;
+use tquic::{CongestionControlAlgorithm, TlsConfig};
 use tracing::info;
 
 const ALPN: &[u8] = b"slipstream";
+
+/// Congestion-control algorithm (CLI value)
+#[derive(Clone, Debug, ValueEnum)]
+pub enum CcArg {
+    Copa,
+    Bbr,
+    Cubic,
+}
+
+impl From<CcArg> for CongestionControlAlgorithm {
+    fn from(v: CcArg) -> Self {
+        match v {
+            CcArg::Copa  => CongestionControlAlgorithm::Copa,
+            CcArg::Bbr   => CongestionControlAlgorithm::Bbr,
+            CcArg::Cubic => CongestionControlAlgorithm::Cubic,
+        }
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "slipstream-server", about = "Slipstream DNS tunnel server (TQUIC branch)")]
@@ -39,13 +57,15 @@ struct Args {
     #[arg(long)]
     dns_listen_port: Option<u16>,
 
+    /// Congestion-control algorithm: copa, bbr, cubic
+    #[arg(long, default_value = "copa")]
+    cc: CcArg,
+
     #[arg(long, default_value = "info")]
     log_level: String,
 }
 
 // ── TLS helpers ────────────────────────────────────────────────────────────────
-// TlsConfig::new_server_config(cert_path: &str, key_path: &str, alpn: Vec<Vec<u8>>, verify_client: bool)
-// Arguments are FILE PATHS to PEM files, not raw PEM content.
 
 fn make_tls_self_signed(domain: &str) -> Result<TlsConfig> {
     let cert = rcgen::generate_simple_self_signed(vec![
@@ -54,7 +74,6 @@ fn make_tls_self_signed(domain: &str) -> Result<TlsConfig> {
     ])
     .context("generating self-signed cert")?;
 
-    // TQUIC needs file paths — write to temp files
     let cert_path = format!("/tmp/slipstream-cert-{}.pem", std::process::id());
     let key_path  = format!("/tmp/slipstream-key-{}.pem",  std::process::id());
 
@@ -67,7 +86,7 @@ fn make_tls_self_signed(domain: &str) -> Result<TlsConfig> {
         &cert_path,
         &key_path,
         vec![ALPN.to_vec()],
-        false, // no client auth
+        false,
     )
     .context("TlsConfig::new_server_config (self-signed)")
 }
@@ -101,7 +120,7 @@ fn main() -> Result<()> {
     }
 
     info!(%dns_listen, upstream = %args.upstream, domain = %args.domain,
-          "slipstream-server (TQUIC branch) starting");
+          cc = ?args.cc, "slipstream-server (TQUIC branch) starting");
 
     let tls_config = if args.self_signed || (args.cert.is_none() && args.key.is_none()) {
         info!("using auto-generated self-signed certificate");
@@ -115,12 +134,14 @@ fn main() -> Result<()> {
         })
     };
 
-    let (tcp_tx, tcp_rx): (TcpTx, TcpRx) = mpsc::sync_channel(1024);
+    let cc: CongestionControlAlgorithm = args.cc.into();
+
+    let (tcp_tx, tcp_rx): (TcpTx, TcpRx) = std::sync::mpsc::sync_channel(1024);
 
     let domain   = args.domain.clone();
     let upstream = args.upstream;
     std::thread::spawn(move || {
-        if let Err(e) = tquic_loop::run(dns_listen, upstream, domain, tls_config, tcp_tx, tcp_rx) {
+        if let Err(e) = tquic_loop::run(dns_listen, upstream, domain, tls_config, cc, tcp_tx, tcp_rx) {
             tracing::error!(%e, "TQUIC event loop crashed");
             std::process::exit(1);
         }

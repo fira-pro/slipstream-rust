@@ -5,7 +5,6 @@ use std::{
     collections::HashMap,
     net::{SocketAddr, UdpSocket as StdUdpSocket},
     rc::Rc,
-    sync::mpsc as std_mpsc,
     time::{Duration, Instant},
 };
 
@@ -38,7 +37,11 @@ impl PacketSendHandler for DnsPacketSender {
     }
 }
 
-fn make_client_config(resolvers: &[SocketAddr], tls_config: TlsConfig) -> Result<Config> {
+fn make_client_config(
+    resolvers: &[SocketAddr],
+    tls_config: TlsConfig,
+    cc: CongestionControlAlgorithm,
+) -> Result<Config> {
     let mut config = Config::new().context("Config::new")?;
 
     // QUIC uses standard >=1200 byte packets; DNS fragmentation is transparent.
@@ -51,10 +54,10 @@ fn make_client_config(resolvers: &[SocketAddr], tls_config: TlsConfig) -> Result
         info!(n = resolvers.len(), "multipath QUIC enabled");
     }
 
-    config.set_congestion_control_algorithm(CongestionControlAlgorithm::Bbr);
+    config.set_congestion_control_algorithm(cc);
     config.set_initial_max_data(128 * 1024 * 1024);           // 128 MB connection window
-    config.set_initial_max_stream_data_bidi_local(16 * 1024 * 1024);  // 16 MB (client→server)
-    config.set_initial_max_stream_data_bidi_remote(16 * 1024 * 1024); // 16 MB (server→client)
+    config.set_initial_max_stream_data_bidi_local(16 * 1024 * 1024);
+    config.set_initial_max_stream_data_bidi_remote(16 * 1024 * 1024);
     config.set_initial_max_streams_bidi(256);
     config.set_max_idle_timeout(300_000);
     config.set_initial_rtt(500);
@@ -67,15 +70,16 @@ pub struct LoopArgs {
     pub server_sni: String,
     pub domain:     String,
     pub tls_config: TlsConfig,
-    pub tcp_rx:     std_mpsc::Receiver<TcpToQuic>,
-    pub ctrl_tx:    std_mpsc::SyncSender<()>,
+    pub cc:         CongestionControlAlgorithm,
+    pub tcp_rx:     tokio::sync::mpsc::Receiver<TcpToQuic>,
+    pub ctrl_tx:    std::sync::mpsc::SyncSender<()>,
 }
 
 pub fn run(args: LoopArgs) -> Result<()> {
     let n = args.resolvers.len();
     assert!(n > 0, "at least one resolver required");
 
-    let config = make_client_config(&args.resolvers, args.tls_config)?;
+    let config = make_client_config(&args.resolvers, args.tls_config, args.cc)?;
 
     // Bind one UDP socket per resolver
     let mut sockets_vec: Vec<MioUdpSocket> = Vec::with_capacity(n);
@@ -131,20 +135,36 @@ pub fn run(args: LoopArgs) -> Result<()> {
     let mut pending_writes: HashMap<u64, Vec<u8>> = HashMap::new();
 
     let mut events         = Events::with_capacity(256);
-    let mut recv_buf       = vec![0u8; 8192];
+    let mut recv_buf       = vec![0u8; 4096];
     let mut last_keepalive = Instant::now();
     let keepalive_interval = Duration::from_millis(20);
 
     loop {
-        let now       = Instant::now();
-        let until_ka  = keepalive_interval
+        // ── 0. Drain TCP→QUIC messages BEFORE polling for I/O ────────────────
+        // Writing to QUIC before poll means the data goes into TQUIC's send
+        // buffer immediately, and the next process_connections() will flush
+        // it into the DNS send path without waiting another poll cycle.
+        if !drain_tcp_rx(
+            &mut args.tcp_rx,
+            &mut endpoint,
+            conn_index,
+            &mut connected,
+            &mut stream_map,
+            &mut pending,
+            &mut pending_writes,
+        ) {
+            return Ok(());
+        }
+
+        let now      = Instant::now();
+        let until_ka = keepalive_interval
             .checked_sub(now.duration_since(last_keepalive))
             .unwrap_or(Duration::ZERO);
         let timeout = endpoint
             .timeout()
             .map(|d| d.min(until_ka))
             .unwrap_or(until_ka)
-            .min(Duration::from_millis(50));
+            .min(Duration::from_millis(20)); // 20ms cap
 
         poll.poll(&mut events, Some(timeout))?;
         endpoint.on_timeout(Instant::now());
@@ -156,7 +176,9 @@ pub fn run(args: LoopArgs) -> Result<()> {
             loop {
                 match sock.recv(&mut recv_buf) {
                     Ok(n) => {
-                        if let Some(mut pkt) = bridge.borrow_mut().decode_dns_response(&recv_buf[..n], ri) {
+                        // decode_dns_response now returns Vec<Vec<u8>> (0-N packets)
+                        let pkts = bridge.borrow().decode_dns_response(&recv_buf[..n], ri);
+                        for mut pkt in pkts {
                             let pkt_info = PacketInfo {
                                 src:  args.resolvers[ri],
                                 dst:  local_addr,
@@ -251,48 +273,61 @@ pub fn run(args: LoopArgs) -> Result<()> {
                 }
             }
         }
+    }
+}
 
-        // ── 6. TCP→QUIC messages ─────────────────────────────────────────────
-        loop {
-            match args.tcp_rx.try_recv() {
-                Ok(TcpToQuic::NewStream { reply_tx }) => {
-                    if connected {
-                        if let Some(conn) = endpoint.conn_get_mut(conn_index) {
-                            open_stream(conn, &mut stream_map, reply_tx);
-                        }
-                    } else {
-                        pending.push(reply_tx);
-                    }
-                }
-                Ok(TcpToQuic::Data { stream_id, data }) => {
+/// Drain the async tcp_rx channel without blocking.
+/// Returns `false` when the channel is disconnected (caller should shut down).
+fn drain_tcp_rx(
+    tcp_rx:        &mut tokio::sync::mpsc::Receiver<TcpToQuic>,
+    endpoint:      &mut Endpoint,
+    conn_index:    u64,
+    connected:     &mut bool,
+    stream_map:    &mut HashMap<u64, tokio::sync::mpsc::Sender<QuicToTcp>>,
+    pending:       &mut Vec<tokio::sync::mpsc::Sender<QuicToTcp>>,
+    pending_writes: &mut HashMap<u64, Vec<u8>>,
+) -> bool {
+    loop {
+        match tcp_rx.try_recv() {
+            Ok(TcpToQuic::NewStream { reply_tx }) => {
+                if *connected {
                     if let Some(conn) = endpoint.conn_get_mut(conn_index) {
-                        stream_write_with_pending(conn, stream_id, data, false, &mut pending_writes);
-                        let _ = conn.stream_want_write(stream_id, true);
+                        open_stream(conn, stream_map, reply_tx);
                     }
+                } else {
+                    pending.push(reply_tx);
                 }
-                Ok(TcpToQuic::Fin { stream_id }) => {
-                    if let Some(conn) = endpoint.conn_get_mut(conn_index) {
-                        let _ = conn.stream_write(stream_id, Bytes::new(), true);
-                    }
+            }
+            Ok(TcpToQuic::Data { stream_id, data }) => {
+                if let Some(conn) = endpoint.conn_get_mut(conn_index) {
+                    stream_write_with_pending(conn, stream_id, data, false, pending_writes);
+                    let _ = conn.stream_want_write(stream_id, true);
                 }
-                Ok(TcpToQuic::Reset { stream_id }) => {
-                    if let Some(conn) = endpoint.conn_get_mut(conn_index) {
-                        // RST_STREAM: stop sending client→server
-                        let _ = conn.stream_shutdown(stream_id, Shutdown::Write, 0);
-                        // STOP_SENDING: ask server to stop sending server→client
-                        let _ = conn.stream_shutdown(stream_id, Shutdown::Read, 0);
-                    }
-                    stream_map.remove(&stream_id);
-                    pending_writes.remove(&stream_id);
+            }
+            Ok(TcpToQuic::Fin { stream_id }) => {
+                if let Some(conn) = endpoint.conn_get_mut(conn_index) {
+                    let _ = conn.stream_write(stream_id, Bytes::new(), true);
                 }
-                Err(std_mpsc::TryRecvError::Empty) => break,
-                Err(std_mpsc::TryRecvError::Disconnected) => {
-                    info!("tcp_rx disconnected, shutting down");
-                    return Ok(());
+            }
+            Ok(TcpToQuic::Reset { stream_id }) => {
+                if let Some(conn) = endpoint.conn_get_mut(conn_index) {
+                    // RST_STREAM: stop sending client→server only.
+                    // Do NOT issue STOP_SENDING here — the server may still be
+                    // sending response data and we don't want to interrupt it
+                    // prematurely (which was causing the RESET_STREAM warning).
+                    let _ = conn.stream_shutdown(stream_id, Shutdown::Write, 0);
                 }
+                stream_map.remove(&stream_id);
+                pending_writes.remove(&stream_id);
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                info!("tcp_rx disconnected, shutting down");
+                return false;
             }
         }
     }
+    true
 }
 
 fn open_stream(
@@ -328,13 +363,20 @@ fn stream_write_with_pending(
         full.extend_from_slice(&data);
         data = full;
     }
-    match conn.stream_write(stream_id, Bytes::from(data.clone()), fin) {
-        Ok(n) if n < data.len() => {
+    let len = data.len();
+    // Use copy_from_slice so `data` stays alive for re-buffering on partial/Done.
+    match conn.stream_write(stream_id, Bytes::copy_from_slice(&data), fin) {
+        Ok(n) if n < len => {
+            // Partial write — save un-sent tail.
             pending.insert(stream_id, data[n..].to_vec());
+            let _ = conn.stream_want_write(stream_id, true);
         }
         Ok(_) => {}
         Err(tquic::Error::Done) => {
+            // Flow-control window full — re-buffer entire payload.
             pending.insert(stream_id, data);
+            let _ = conn.stream_want_write(stream_id, true);
+            debug!(stream_id, "stream window full, buffering");
         }
         Err(e) => warn!(stream_id, %e, "stream_write error"),
     }

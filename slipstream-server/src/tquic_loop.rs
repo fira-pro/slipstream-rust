@@ -1,10 +1,4 @@
 //! Server mio event loop — drives TQUIC and the DNS bridge.
-//!
-//! TCP→QUIC data path (now wired):
-//! - tcp_rx channel carries TcpMsg::{Data, Fin} from per-stream forwarder threads
-//! - For each message: use endpoint.conn_get_mut(conn_idx) to get the Connection
-//!   then conn.stream_write() / stream_shutdown()
-//! - After writing: call conn.stream_want_write() to request on_stream_writable callback
 
 use std::{
     cell::RefCell,
@@ -18,7 +12,9 @@ use std::{
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use mio::{Events, Interest, Poll, Token, net::UdpSocket as MioUdpSocket};
-use tquic::{Config, CongestionControlAlgorithm, Endpoint, PacketInfo, PacketSendHandler, TlsConfig};
+use tquic::{
+    Config, CongestionControlAlgorithm, Endpoint, PacketInfo, PacketSendHandler, TlsConfig,
+};
 use tracing::{debug, info, warn};
 
 use crate::dns_bridge::DnsBridge;
@@ -40,25 +36,21 @@ impl PacketSendHandler for DnsPacketSender {
     }
 }
 
-fn make_server_config(_domain: &str, tls_config: TlsConfig) -> Result<Config> {
+fn make_server_config(
+    _domain: &str,
+    tls_config: TlsConfig,
+    cc: CongestionControlAlgorithm,
+) -> Result<Config> {
     let mut config = Config::new().context("Config::new")?;
 
-    // NOTE: Do NOT set send/recv_udp_payload_size here.
-    // QUIC must use standard >=1200 byte packets per RFC 9000.
-    // DNS fragmentation is transparent — the bridge fragments/reassembles
-    // 1200-byte QUIC packets into small DNS queries invisibly.
-    // Setting max_udp_payload_size < 1200 violates RFC 9000 -> TransportParameterError.
-
     // Disable MTU discovery — our transport is DNS, not raw UDP.
-    // Without this, TQUIC sends 1472-byte PING+PADDING probes that waste
-    // output_q slots and are too large for DNS transport.
     config.enable_dplpmtud(false);
 
-    config.set_congestion_control_algorithm(CongestionControlAlgorithm::Copa);
+    config.set_congestion_control_algorithm(cc);
     config.set_initial_congestion_window(64);
-    config.set_initial_max_data(128 * 1024 * 1024);           // 128 MB connection window
-    config.set_initial_max_stream_data_bidi_remote(16 * 1024 * 1024); // 16 MB per stream (client→server)
-    config.set_initial_max_stream_data_bidi_local(16 * 1024 * 1024);  // 16 MB per stream (server→client)
+    config.set_initial_max_data(128 * 1024 * 1024);
+    config.set_initial_max_stream_data_bidi_remote(16 * 1024 * 1024);
+    config.set_initial_max_stream_data_bidi_local(16 * 1024 * 1024);
     config.set_initial_max_streams_bidi(256);
     config.set_max_idle_timeout(300_000);
     config.set_initial_rtt(400);
@@ -71,10 +63,11 @@ pub fn run(
     target: SocketAddr,
     domain: String,
     tls_config: TlsConfig,
+    cc: CongestionControlAlgorithm,
     tcp_tx: TcpTx,
     tcp_rx: TcpRx,
 ) -> Result<()> {
-    let config = make_server_config(&domain, tls_config)?;
+    let config = make_server_config(&domain, tls_config, cc)?;
     let bridge = Rc::new(RefCell::new(DnsBridge::new(domain.clone())));
 
     let sender: Rc<dyn PacketSendHandler> = Rc::new(DnsPacketSender { bridge: bridge.clone() });
@@ -91,12 +84,10 @@ pub fn run(
 
     info!(%dns_bind, "TQUIC server event loop started");
 
-    // Fixed virtual client address used for ALL injected QUIC packets.
-    // External resolvers change src port/IP per query; a constant address
-    // prevents TQUIC from triggering path migration / PATH_CHALLENGE.
+    // Fixed virtual client address — prevents path migration on every DNS query
+    // (external resolvers change src port/IP between queries).
     let virtual_client: SocketAddr = "100.64.0.1:4444".parse().unwrap();
 
-    // Resolve 0.0.0.0 → 127.0.0.1 so TQUIC gets a real unicast dst address.
     let local_bind: SocketAddr = if dns_bind.ip().is_unspecified() {
         let ip = if dns_bind.is_ipv6() {
             std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
@@ -111,15 +102,15 @@ pub fn run(
     let mut events   = Events::with_capacity(256);
     let mut recv_buf = vec![0u8; 4096];
     // server_pending: data that couldn't be written to a QUIC stream because
-    // the stream's flow-control window was full (stream_write returned Done).
-    // Retried each mio loop iteration and via on_stream_writable.
+    // the stream's flow-control window was full.
     let mut server_pending: HashMap<(usize, u64), Vec<u8>> = HashMap::new();
 
     loop {
+        // Cap at 20ms to keep the loop responsive for both directions.
         let timeout = endpoint
             .timeout()
-            .map(|d| d.min(Duration::from_millis(50)))
-            .unwrap_or(Duration::from_millis(50));
+            .map(|d| d.min(Duration::from_millis(20)))
+            .unwrap_or(Duration::from_millis(20));
 
         poll.poll(&mut events, Some(timeout))?;
         endpoint.on_timeout(Instant::now());
@@ -127,23 +118,18 @@ pub fn run(
 
         // ── 1. Drain incoming DNS queries ─────────────────────────────────
         //
-        // KEY: Use a fixed virtual client address for all injected QUIC packets.
-        // External recursive resolvers change their src port/IP between queries,
-        // which TQUIC interprets as path migration (triggers PATH_CHALLENGE frames
-        // that fail, dropping all data). By injecting all packets with the same
-        // virtual src, TQUIC sees a stable single path.
+        // KEY: always inject with a fixed virtual client address so TQUIC
+        // sees a stable single path and doesn't trigger PATH_CHALLENGE frames.
         loop {
             match dns_sock.recv_from(&mut recv_buf) {
                 Ok((n, peer_addr)) => {
-                    // Step 1: decode DNS query → extract QUIC payload
                     let (raw_query, assembled) =
                         bridge.borrow_mut().decode_query(&recv_buf[..n]);
 
-                    // Step 2: inject with FIXED virtual address (not real peer_addr)
                     if let Some(mut quic_pkt) = assembled {
                         let pkt_info = PacketInfo {
-                            src:  virtual_client,  // ← always the same
-                            dst:  local_bind,       // ← server's real local addr
+                            src:  virtual_client,
+                            dst:  local_bind,
                             time: Instant::now(),
                         };
                         if let Err(e) = endpoint.recv(&mut quic_pkt, &pkt_info) {
@@ -151,14 +137,13 @@ pub fn run(
                         }
                     }
 
-                    // Step 3: flush TQUIC send path BEFORE building the response.
-                    // This is critical: for keepalive/poll queries (assembled=None)
-                    // we still need to flush any TCP→QUIC data that was written
-                    // since the last recv so it appears in output_q and gets
-                    // returned to the client in this DNS response.
+                    // Flush TQUIC send path BEFORE building the response, so
+                    // any TCP→QUIC data written since the last recv appears
+                    // in output_q and can be packed into this DNS response.
                     let _ = endpoint.process_connections();
 
-                    // Step 4: respond to the ACTUAL peer_addr (real resolver IP)
+                    // encode_response packs multiple queued QUIC packets into
+                    // one TXT record (2-byte length-prefix framing).
                     let response = bridge.borrow_mut().encode_response(&raw_query);
                     if !response.is_empty() {
                         if let Err(e) = dns_sock.send_to(&response, peer_addr) {
@@ -172,23 +157,12 @@ pub fn run(
         }
 
         // ── 2. TCP→QUIC: drain messages from TCP forwarder threads ────────────
-        //
-        // The handler's on_stream_created spawns a TCP forwarder per stream.
-        // The forwarder reads from TCP and pushes TcpMsg::Data/Fin here.
-        // We use endpoint.conn_get_mut(conn_idx) to write directly to QUIC.
-        //
-        // TQUIC connection index policy: connections are indexed sequentially.
-        // The handler tracks conn_idx → stable u64 index via its conn_idx_map.
-        // For the event loop we expose get_conn_index_for() via the conn_ptr stored
-        // in the handler — but the simplest approach is to track conn_idx here
-        // by wrapping in a shared map.
         let mut tcp_msgs_drained = false;
         loop {
             match tcp_rx.try_recv() {
                 Ok(TcpMsg::Data { conn_idx, stream_id, data }) => {
                     tcp_msgs_drained = true;
                     if let Some(conn) = endpoint.conn_get_mut(conn_idx as u64) {
-                        // Prepend any previously un-sent bytes for this stream.
                         let payload = if let Some(mut prev) = server_pending.remove(&(conn_idx, stream_id)) {
                             prev.extend_from_slice(&data);
                             prev
@@ -197,14 +171,12 @@ pub fn run(
                         };
                         match conn.stream_write(stream_id, Bytes::copy_from_slice(&payload), false) {
                             Ok(n) if n < payload.len() => {
-                                // Partial write — save remainder.
                                 server_pending.insert((conn_idx, stream_id), payload[n..].to_vec());
                                 let _ = conn.stream_want_write(stream_id, true);
                                 debug!(conn_idx, stream_id, n, total = payload.len(), "tcp→quic partial");
                             }
                             Ok(n) => debug!(conn_idx, stream_id, n, "tcp→quic"),
                             Err(tquic::Error::Done) => {
-                                // Flow-control window full — buffer for retry.
                                 debug!(conn_idx, stream_id, "stream window full, buffering");
                                 server_pending.insert((conn_idx, stream_id), payload);
                                 let _ = conn.stream_want_write(stream_id, true);
@@ -227,6 +199,7 @@ pub fn run(
                 }
             }
         }
+
         // Retry buffered data for streams whose window re-opened.
         if !server_pending.is_empty() {
             let pending_keys: Vec<(usize, u64)> = server_pending.keys().cloned().collect();
@@ -246,15 +219,12 @@ pub fn run(
                             Err(_) => {} // stream closed — discard
                         }
                     }
-                    // conn gone → stream closed; discard buffered data
                 }
             }
         }
 
-        // Flush any stream data written above into output_q so the next
-        // incoming DNS query (or keepalive) can carry it back to the client.
-        // Without this, data sits in TQUIC's send buffer until the next
-        // mio-loop iteration's on_timeout / process_connections call.
+        // Flush any stream data written above so the next incoming DNS query
+        // can carry it back to the client.
         if tcp_msgs_drained {
             let _ = endpoint.process_connections();
         }

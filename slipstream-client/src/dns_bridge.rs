@@ -3,8 +3,10 @@
 //! Client→Server: large QUIC packets are fragmented into small DNS queries
 //! using encode_dns_queries (adds [frag_id:2][seq:1][total:1] header per query).
 //!
-//! Server→Client: one complete raw QUIC packet per DNS TXT response, no header.
-//! Simply call decode_dns_response and return the bytes directly.
+//! Server→Client: one or more raw QUIC packets per DNS TXT response, packed
+//! using 2-byte big-endian length-prefix framing:
+//!   `[len_hi][len_lo][packet bytes] [len_hi][len_lo][packet bytes] ...`
+//! We unpack each and return them separately for injection into TQUIC.
 
 use slipstream_core::{decode_dns_response, encode_dns_queries, encode_dns_query};
 use tracing::{debug, trace, warn};
@@ -52,23 +54,59 @@ impl ClientDnsBridge {
         }
     }
 
-    /// Decode a DNS response → raw QUIC packet (or None for empty responses).
+    /// Decode a DNS response → zero or more raw QUIC packets.
     ///
-    /// Server→client: one complete QUIC packet per response, no fragmentation header.
-    pub fn decode_dns_response(&self, wire: &[u8], resolver_idx: usize) -> Option<Vec<u8>> {
+    /// Server→client responses carry one or more QUIC packets packed with
+    /// 2-byte big-endian length-prefix framing.  We unpack all of them.
+    /// Returns an empty Vec for NXDOMAIN / empty / malformed responses.
+    pub fn decode_dns_response(&self, wire: &[u8], resolver_idx: usize) -> Vec<Vec<u8>> {
         match decode_dns_response(wire) {
             Ok(Some(data)) => {
-                debug!(resolver_idx, bytes = data.len(), "DNS response: QUIC data");
-                Some(data)
+                let pkts = unpack_framed(&data);
+                debug!(resolver_idx, n_pkts = pkts.len(), bytes = data.len(), "DNS response: QUIC data");
+                pkts
             }
             Ok(None) => {
                 trace!(resolver_idx, "DNS response: empty (server has no data yet)");
-                None
+                Vec::new()
             }
             Err(e) => {
                 debug!(%e, resolver_idx, "DNS response decode failed");
-                None
+                Vec::new()
             }
         }
     }
+}
+
+/// Unpack `[u16-BE len][bytes] ...` framing into individual packets.
+///
+/// Falls back to treating the entire payload as a single raw packet if the
+/// framing doesn't parse correctly (e.g. connecting to an older server build).
+fn unpack_framed(data: &[u8]) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+
+    while pos + 2 <= data.len() {
+        let len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+        pos += 2;
+        if pos + len > data.len() {
+            // Malformed frame — treat whole remaining slice as one raw packet
+            // (backwards-compat with unframed servers)
+            if out.is_empty() {
+                out.push(data.to_vec());
+            } else {
+                warn!(pos, len, total = data.len(), "framed DNS response: truncated packet, dropping tail");
+            }
+            return out;
+        }
+        out.push(data[pos..pos + len].to_vec());
+        pos += len;
+    }
+
+    if out.is_empty() && !data.is_empty() {
+        // No frames decoded — either empty or old unframed format
+        out.push(data.to_vec());
+    }
+
+    out
 }
