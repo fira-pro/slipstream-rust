@@ -70,34 +70,13 @@ impl TransportHandler for ClientHandler {
         debug!(stream_id, "QUIC stream created (server-initiated, ignored on client)");
     }
 
-    fn on_stream_readable(&mut self, conn: &mut Connection, stream_id: u64) {
-        let mut buf = vec![0u8; 16 * 1024];
-        loop {
-            match conn.stream_read(stream_id, &mut buf) {
-                Ok((0, _)) => break,
-                Ok((n, fin)) => {
-                    if let Some(s) = self.streams.get(&stream_id) {
-                        let _ = s.reply_tx.try_send(QuicToTcp::Data {
-                            data: buf[..n].to_vec(),
-                        });
-                    }
-                    if fin {
-                        if let Some(s) = self.streams.remove(&stream_id) {
-                            let _ = s.reply_tx.try_send(QuicToTcp::Fin);
-                        }
-                        break;
-                    }
-                }
-                Err(tquic::Error::Done) => break,
-                Err(e) => {
-                    warn!(stream_id, %e, "stream_read error");
-                    if let Some(s) = self.streams.remove(&stream_id) {
-                        let _ = s.reply_tx.try_send(QuicToTcp::Fin);
-                    }
-                    break;
-                }
-            }
-        }
+    fn on_stream_readable(&mut self, _conn: &mut Connection, stream_id: u64) {
+        // DO NOT read data here. For client-initiated streams, self.streams is
+        // never populated (stream channels live in the event loop's stream_map).
+        // Reading here would consume bytes from the QUIC buffer and silently
+        // drop them. The event loop's step 3 (stream_readable_iter + stream_read)
+        // handles forwarding to the correct TCP task via stream_map.
+        debug!(stream_id, "stream readable (handled in event loop)");
     }
 
     fn on_stream_writable(&mut self, _conn: &mut Connection, stream_id: u64) {

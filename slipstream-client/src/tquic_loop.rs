@@ -42,6 +42,9 @@ fn make_client_config(resolvers: &[SocketAddr], tls_config: TlsConfig) -> Result
     let mut config = Config::new().context("Config::new")?;
 
     // QUIC uses standard >=1200 byte packets; DNS fragmentation is transparent.
+    // Disable MTU discovery — DNS transport cannot carry large probe packets.
+    config.enable_dplpmtud(false);
+
     if resolvers.len() > 1 {
         config.enable_multipath(true);
         config.set_multipath_algorithm(MultipathAlgorithm::MinRtt);

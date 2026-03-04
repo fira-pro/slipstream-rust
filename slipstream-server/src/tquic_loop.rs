@@ -48,6 +48,11 @@ fn make_server_config(_domain: &str, tls_config: TlsConfig) -> Result<Config> {
     // 1200-byte QUIC packets into small DNS queries invisibly.
     // Setting max_udp_payload_size < 1200 violates RFC 9000 -> TransportParameterError.
 
+    // Disable MTU discovery — our transport is DNS, not raw UDP.
+    // Without this, TQUIC sends 1472-byte PING+PADDING probes that waste
+    // output_q slots and are too large for DNS transport.
+    config.enable_dplpmtud(false);
+
     config.set_congestion_control_algorithm(CongestionControlAlgorithm::Copa);
     config.set_initial_congestion_window(64);
     config.set_initial_max_data(512 * 1024);
