@@ -101,11 +101,11 @@ fn build_client_config(accept_insecure: bool, keep_alive_ms: u64, domain: &str) 
 
     // ── MTU: sized so every DNS response fits in 512 bytes ──────────────
     // The ISP resolver caps DNS UDP responses at ~512 bytes. A DNS response
-    // echoes back the full QNAME from the query (≈254 bytes wire for t.game.et),
-    // leaving only ~198 bytes for QUIC payload. Setting initial_mtu to this
+    // echoes back the full QNAME from the query (capped to 200 bytes wire now),
+    // leaving more bytes for QUIC payload. Setting initial_mtu to this
     // value keeps ALL packets (including handshake) inside the resolver budget.
     let tunnel_mtu: u16 = {
-        let avail_chars = 253usize.saturating_sub(domain.len() + 1);
+        let avail_chars = 200usize.saturating_sub(domain.len() + 1);
         let b32_max = avail_chars * 63 / 64;
         let client_chunk = (b32_max * 5 / 8).saturating_sub(4);
         let frag_bytes = client_chunk + 4;
@@ -116,6 +116,11 @@ fn build_client_config(accept_insecure: bool, keep_alive_ms: u64, domain: &str) 
             .map(|l| 1 + l.len())
             .sum::<usize>() + 1;
         let qname_wire = subdomain_wire + domain_wire;
+        
+        // Response overhead (fixed part)
+        // 12 (header) + qname_wire (Question) + 4 (QTYPE/CLASS) 
+        // + 2 (compressed Answer NAME) + 10 (Answer TYPE/CLASS/TTL/RDLENGTH) 
+        // + 11 (EDNS0) + 1 (TXT length prefix per 255b) + 20 (safety)
         let overhead = 12 + qname_wire + 4 + 2 + 10 + 11 + 1 + 20;
         let available = 512usize.saturating_sub(overhead);
         (available as u16).max(60).min(250)

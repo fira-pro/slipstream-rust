@@ -32,9 +32,10 @@ use clap::Parser;
 use quinn::{crypto::rustls::QuicServerConfig, Endpoint, EndpointConfig, ServerConfig};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use slipstream_core::{
-    codec::encode_dns_response,
+    codec::{encode_dns_response, max_resp_chunk_size},
     config::{ALPN_PROTOCOL, SERVER_SNI},
 };
+use rand::Rng;
 use tokio::{
     io::AsyncWriteExt,
     net::{TcpStream, UdpSocket},
@@ -172,8 +173,8 @@ fn build_server_config(
     // `initial_mtu` applies from the very first QUIC packet flight, including
     // Initial/Handshake (ServerHello, cert fragments) — this is the key.
     let tunnel_mtu: u16 = {
-        // Replicate max_quic_chunk_size formula:
-        let avail_chars = 253usize.saturating_sub(domain.len() + 1);
+        // Replicate max_quic_chunk_size formula (capped at 200 bytes):
+        let avail_chars = 200usize.saturating_sub(domain.len() + 1);
         let b32_max = avail_chars * 63 / 64;
         let client_chunk = (b32_max * 5 / 8).saturating_sub(4); // FRAG_HEADER_LEN = 4
         let frag_bytes = client_chunk + 4;
@@ -188,7 +189,11 @@ fn build_server_config(
             .map(|l| 1 + l.len())
             .sum::<usize>() + 1;
         let qname_wire = subdomain_wire + domain_wire;
+        
         // Response overhead (fixed part)
+        // 12 (header) + qname_wire (Question) + 4 (QTYPE/CLASS) 
+        // + 2 (compressed Answer NAME) + 10 (Answer TYPE/CLASS/TTL/RDLENGTH) 
+        // + 11 (EDNS0) + 1 (TXT length prefix) + 20 (safety margin)
         let overhead = 12 + qname_wire + 4 + 2 + 10 + 11 + 1 + 20;
         let available = 512usize.saturating_sub(overhead);
         (available as u16).max(60).min(250)
@@ -399,18 +404,43 @@ async fn run_bridge(
                 }
             }
 
-            // --- QUIC packet from quinn → push to output buffer ---
+            // --- QUIC packet from quinn → fragment and push to output_q ---
+            // quinn cannot produce Initial packets smaller than 1200 bytes.
+            // We split each quinn packet into resp_chunk_size-byte pieces.
+            // Each piece gets a 4-byte resp-frag header prepended:
+            //   [resp_frag_id_hi, resp_frag_id_lo, seq, total]
+            // The client bridge reads this header, buffers fragments, and
+            // reassembles them before injecting into its local QUIC loopback.
             result = bridge_sock.recv(&mut quic_buf) => {
                 match result {
                     Err(e) => { warn!(%e, "bridge: QUIC recv error"); continue; }
                     Ok(n) => {
-                        let data = quic_buf[..n].to_vec();
-                        if output_q.len() >= MAX_OUTPUT_Q {
-                            output_q.pop_front();
-                            warn!(q_len = MAX_OUTPUT_Q, "bridge: output_q overflow, dropped oldest");
+                        let quic_packet = quic_buf[..n].to_vec();
+                        let total_bytes = quic_packet.len();
+                        let resp_frag_id: u16 = rand::thread_rng().gen();
+                        let chunks: Vec<&[u8]> = quic_packet.chunks(resp_chunk_size).collect();
+                        let total_frags = chunks.len().min(255) as u8;
+
+                        for (seq, chunk) in chunks.iter().enumerate() {
+                            if seq >= 255 { break; }
+                            let mut item = Vec::with_capacity(4 + chunk.len());
+                            item.extend_from_slice(&resp_frag_id.to_be_bytes());
+                            item.push(seq as u8);
+                            item.push(total_frags);
+                            item.extend_from_slice(chunk);
+                            if output_q.len() >= MAX_OUTPUT_Q {
+                                output_q.pop_front();
+                                warn!(q_len = MAX_OUTPUT_Q, "bridge: output_q overflow, dropped oldest chunk");
+                            }
+                            output_q.push_back(item);
                         }
-                        output_q.push_back(data);
-                        info!(q_len = output_q.len(), bytes = n, "bridge: ← quinn QUIC packet queued for next DNS poll");
+
+                        info!(
+                            q_len = output_q.len(),
+                            quic_bytes = total_bytes,
+                            chunks = total_frags,
+                            "bridge: ← quinn packet split into {} DNS chunks", total_frags
+                        );
                     }
                 }
             }

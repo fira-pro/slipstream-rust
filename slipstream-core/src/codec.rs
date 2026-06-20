@@ -72,16 +72,25 @@ fn write_u32(buf: &mut Vec<u8>, v: u32) {
 /// Layout: [frag_id_hi, frag_id_lo, seq_num, total_frags]
 pub const FRAG_HEADER_LEN: usize = 4;
 
-/// Maximum QUIC payload bytes that fit in one DNS query QNAME for the given domain.
+/// Returns the maximum number of QUIC bytes we can stuff into a single query's QNAME.
 pub fn max_quic_chunk_size(domain: &str) -> usize {
-    // Available text chars for subdomain: 253 (max QNAME) - domain.len() - 1 (separator dot)
-    let available = 253usize.saturating_sub(domain.len() + 1);
-    // dotify adds 1 dot per 63 base32 chars, so: b32_chars + b32_chars/63 <= available
-    // => b32_chars <= available * 63 / 64
-    let b32_chars = available * 63 / 64;
-    // 8 base32 chars encode 5 bytes
-    let raw_bytes = b32_chars * 5 / 8;
-    raw_bytes.saturating_sub(FRAG_HEADER_LEN).max(1)
+    // We intentionally restrict the max QNAME wire size to ~200 bytes.
+    // Why? The server responds by echoing the QNAME in the Question section,
+    // plus the Answer section containing up to 1200 bytes of QUIC data.
+    // If the QNAME is 255 bytes, the response totals ~1500 bytes, which with
+    // UDP/IP headers exceeds standard 1500 MTU, causing IP fragmentation.
+    // Many ISPs drop IP fragments. Capping at 200 bytes gives us ~55 bytes of headroom.
+    let max_qname = 200; // previously 253
+    let avail_chars = max_qname.saturating_sub(domain.len() + 1);
+
+    // 63 chars per 64 bytes wire (since each label has a length byte)
+    let b32_max = avail_chars * 63 / 64;
+
+    // base32 decodes 8 chars to 5 bytes
+    let bytes = (b32_max * 5) / 8;
+
+    // Subtract 4 bytes for our custom fragmentation header
+    bytes.saturating_sub(4).max(1)
 }
 
 /// Encode a QUIC packet (any size) into one or more DNS TXT query wire blobs.
@@ -271,7 +280,8 @@ pub fn encode_dns_response(query_wire: &[u8], quic_data: &[u8]) -> Result<Vec<u8
 
     // Answer (if we have data)
     if !quic_data.is_empty() {
-        write_name(&mut buf, &qname);
+        // DNS compression: pointer to the QNAME at offset 12 in the packet
+        write_u16(&mut buf, 0xC00C);
         write_u16(&mut buf, DNS_TYPE_TXT);
         write_u16(&mut buf, DNS_CLASS_IN);
         write_u32(&mut buf, 60); // TTL
