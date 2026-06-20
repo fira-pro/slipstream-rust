@@ -100,24 +100,32 @@ fn build_client_config(accept_insecure: bool, keep_alive_ms: u64, domain: &str) 
     transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
 
     // ── MTU: sized so every DNS response fits in 512 bytes ──────────────
-    // Many ISP recursive resolvers only relay DNS UDP responses up to 512 bytes
-    // back to clients (the old pre-EDNS limit). A QUIC packet larger than
-    // ~200 bytes, once wrapped in a DNS TXT response, can exceed 512 bytes
-    // and get silently dropped by the resolver, killing the handshake.
-    //
-    // `initial_mtu` sets the packet size for ALL QUIC flights, including the
-    // Initial/Handshake packet number spaces (ServerHello, cert, etc.).
-    // `upper_bound` prevents MTU discovery from probing above this value.
-    let isp_response_budget: u16 = 512;
-    let dns_overhead: u16 = 73 + domain.len() as u16 + 40; // conservative
-    let max_quic_in_response = isp_response_budget.saturating_sub(dns_overhead);
-    let tunnel_mtu = max_quic_in_response.max(60).min(500);
-
-    transport.initial_mtu(tunnel_mtu);
+    // The ISP resolver caps DNS UDP responses at ~512 bytes. A DNS response
+    // echoes back the full QNAME from the query (≈254 bytes wire for t.game.et),
+    // leaving only ~198 bytes for QUIC payload. Setting initial_mtu to this
+    // value keeps ALL packets (including handshake) inside the resolver budget.
+    let tunnel_mtu: u16 = {
+        let avail_chars = 253usize.saturating_sub(domain.len() + 1);
+        let b32_max = avail_chars * 63 / 64;
+        let client_chunk = (b32_max * 5 / 8).saturating_sub(4);
+        let frag_bytes = client_chunk + 4;
+        let b32_len = (frag_bytes * 8 + 4) / 5;
+        let label_count = (b32_len + 62) / 63;
+        let subdomain_wire = label_count + b32_len;
+        let domain_wire: usize = domain.split('.')
+            .map(|l| 1 + l.len())
+            .sum::<usize>() + 1;
+        let qname_wire = subdomain_wire + domain_wire;
+        let overhead = 12 + qname_wire + 4 + 2 + 10 + 11 + 1 + 20;
+        let available = 512usize.saturating_sub(overhead);
+        (available as u16).max(60).min(250)
+    };
 
     let mut mtu_cfg = quinn::MtuDiscoveryConfig::default();
     mtu_cfg.upper_bound(tunnel_mtu);
     transport.mtu_discovery_config(Some(mtu_cfg));
+
+    transport.initial_mtu(tunnel_mtu);
 
     // ── Window sizes ─────────────────────────────────────────────────────────
     // 512 KB is plenty for a DNS tunnel at ~5-50 KB/s effective bandwidth.

@@ -141,30 +141,64 @@ fn build_server_config(
 
     // ── MTU: sized so every DNS response fits in 512 bytes ────────────────
     //
-    // Many ISP recursive resolvers (especially in Africa/Asia) only relay DNS
-    // UDP responses up to 512 bytes back to clients — the old pre-EDNS limit.
-    // If a DNS TXT response carrying a QUIC packet exceeds 512 bytes, the
-    // resolver silently drops or truncates it, killing the handshake.
+    // ISP recursive resolvers commonly cap DNS UDP responses at 512 bytes
+    // (the pre-EDNS limit) before relaying to clients. If a DNS TXT response
+    // carrying a QUIC packet exceeds 512 bytes it is silently dropped, stalling
+    // the QUIC handshake.
     //
-    // Budget breakdown for a 512-byte DNS response:
-    //   12  DNS header
-    //  ~36  question section overhead (QTYPE + QCLASS + root label)
-    //  ~11  EDNS OPT RR
-    //  ~14  answer RR overhead (compressed name ptr + type/class/TTL/rdlen)
-    //  = ~73 bytes fixed overhead, leaving ~439 for QNAME wire + QUIC payload.
+    // The DNS response echoes back the CLIENT's query QNAME, whose wire size
+    // is determined by how much QUIC data the client packs per query:
     //
-    // The QNAME wire length ≈ domain.len() + 2*label_overhead.
-    // We use a conservative budget of 200 bytes for QUIC payload.
+    //   client_chunk  = max_quic_chunk_size(domain)          (≈ 145 bytes for t.game.et)
+    //   frag_bytes    = client_chunk + 4 (FRAG_HEADER_LEN)   (≈ 149)
+    //   b32_len       = ceil(frag_bytes * 8 / 5)             (≈ 239 chars)
+    //   label_count   = ceil(b32_len / 63)                    (= 4 labels)
+    //   subdomain_wire = label_count (length bytes) + b32_len (chars) (= 4+239 = 243)
+    //   domain_wire   = sum of (1 + label.len) + 1 root       (= 11 for t.game.et)
+    //   qname_wire    = subdomain_wire + domain_wire           (≈ 254 bytes!)
     //
-    // This initial_mtu forces quinn to use small packets from the very first
-    // flight — INCLUDING the ServerHello and certificate — so every DNS
-    // response the server produces is safely under 512 bytes.
-    let isp_response_budget: u16 = 512;
-    let dns_overhead: u16 = 73 + domain.len() as u16 + 40; // conservative
-    let max_quic_in_response = isp_response_budget.saturating_sub(dns_overhead);
-    // Clamp: quinn requires initial_mtu >= 1200 is NOT true — it supports lower
-    // for tunneling. Minimum usable for QUIC is ~60 bytes.
-    let tunnel_mtu = max_quic_in_response.max(60).min(500);
+    // DNS response overhead:
+    //   12  header
+    //   qname_wire  question QNAME (the big one)
+    //    4  QTYPE + QCLASS
+    //    2  answer name (compression pointer)
+    //   10  answer TYPE+CLASS+TTL+RDLENGTH
+    //   11  EDNS OPT RR
+    //    1  TXT string length prefix
+    //   20  safety margin
+    //  ─────────────────────────────────────────────────────
+    //   60 + qname_wire ≈ 314 bytes fixed → leaves 198 bytes for QUIC payload
+    //
+    // `initial_mtu` applies from the very first QUIC packet flight, including
+    // Initial/Handshake (ServerHello, cert fragments) — this is the key.
+    let tunnel_mtu: u16 = {
+        // Replicate max_quic_chunk_size formula:
+        let avail_chars = 253usize.saturating_sub(domain.len() + 1);
+        let b32_max = avail_chars * 63 / 64;
+        let client_chunk = (b32_max * 5 / 8).saturating_sub(4); // FRAG_HEADER_LEN = 4
+        let frag_bytes = client_chunk + 4;
+        // ceil(frag_bytes * 8 / 5)
+        let b32_len = (frag_bytes * 8 + 4) / 5;
+        // ceil(b32_len / 63)
+        let label_count = (b32_len + 62) / 63;
+        // wire: each label has a 1-byte length prefix
+        let subdomain_wire = label_count + b32_len;
+        // domain wire: each label as (len_byte + chars) + root
+        let domain_wire: usize = domain.split('.')
+            .map(|l| 1 + l.len())
+            .sum::<usize>() + 1;
+        let qname_wire = subdomain_wire + domain_wire;
+        // Response overhead (fixed part)
+        let overhead = 12 + qname_wire + 4 + 2 + 10 + 11 + 1 + 20;
+        let available = 512usize.saturating_sub(overhead);
+        (available as u16).max(60).min(250)
+    };
+
+    info!(
+        domain,
+        tunnel_mtu,
+        "computed tunnel MTU for ISP-friendly 512-byte DNS responses"
+    );
 
     transport.initial_mtu(tunnel_mtu);
 
@@ -275,9 +309,6 @@ async fn run_bridge(
                             }
                             Ok((frag_id, seq, total, chunk)) => {
                                 // ── Stale fragment GC ─────────────────────────────
-                                // Clean up partial assemblies older than FRAG_TTL_SECS.
-                                // Without this, a lost fragment causes permanent map growth
-                                // and also prevents clean retransmission from the client.
                                 let now = std::time::Instant::now();
                                 reassembly.retain(|_, st| {
                                     now.duration_since(st.created_at).as_secs() < FRAG_TTL_SECS
@@ -286,12 +317,21 @@ async fn run_bridge(
                                 // ── Step 1: inject incoming QUIC data into quinn ──
                                 if !chunk.is_empty() {
                                     if total == 1 {
-                                        // Single fragment — inject directly
+                                        info!(
+                                            %client_addr, frag_id,
+                                            quic_bytes = chunk.len(),
+                                            "bridge: ← QUIC single-frag from ISP resolver, injecting"
+                                        );
                                         if let Err(e) = bridge_sock.send(&chunk).await {
                                             warn!(%e, "bridge: inject failed");
                                         }
                                     } else {
                                         // Multi-fragment — reassemble first
+                                        info!(
+                                            %client_addr, frag_id, seq, total,
+                                            chunk_bytes = chunk.len(),
+                                            "bridge: ← QUIC fragment from ISP resolver"
+                                        );
                                         let entry = reassembly.entry(frag_id).or_insert_with(|| FragState {
                                             chunks: HashMap::new(),
                                             total,
@@ -309,25 +349,45 @@ async fn run_bridge(
                                                 }
                                             }
                                             if ok {
-                                                tracing::debug!(frag_id, total, bytes=assembled.len(), "reassembled");
+                                                info!(
+                                                    frag_id, total,
+                                                    bytes = assembled.len(),
+                                                    "bridge: ← reassembled complete QUIC packet, injecting into quinn"
+                                                );
                                                 if let Err(e) = bridge_sock.send(&assembled).await {
                                                     warn!(%e, "bridge: inject assembled failed");
                                                 }
                                             }
                                             reassembly.remove(&frag_id);
+                                        } else {
+                                            debug!(
+                                                frag_id, seq, total,
+                                                got = entry.chunks.len(),
+                                                "bridge: waiting for more fragments"
+                                            );
                                         }
                                     }
+                                } else {
+                                    debug!(%client_addr, "bridge: keepalive poll (no QUIC data)");
                                 }
 
-                                // ── Step 2: respond immediately with buffered QUIC or NXDOMAIN ──
-                                // This is the key change: server ALWAYS replies instantly.
-                                // Recursive resolvers never time out. Reconnects are clean.
+                                // ── Step 2: respond immediately ───────────────────
                                 let quic_out = output_q.pop_front();
                                 let resp_data: &[u8] = quic_out.as_deref().unwrap_or(&[]);
                                 match encode_dns_response(&wire, resp_data) {
                                     Err(e) => warn!(%e, "bridge: encode response failed"),
                                     Ok(resp) => {
-                                        trace_packet("quic→dns", resp_data.len(), client_addr);
+                                        if resp_data.is_empty() {
+                                            debug!(%client_addr, "bridge: → NXDOMAIN (no queued QUIC)");
+                                        } else {
+                                            info!(
+                                                %client_addr,
+                                                quic_bytes = resp_data.len(),
+                                                dns_resp_bytes = resp.len(),
+                                                q_remaining = output_q.len(),
+                                                "bridge: → QUIC response via DNS TXT"
+                                            );
+                                        }
                                         if let Err(e) = dns_sock.send_to(&resp, client_addr).await {
                                             warn!(%e, "bridge: send response failed");
                                         }
@@ -346,13 +406,11 @@ async fn run_bridge(
                     Ok(n) => {
                         let data = quic_buf[..n].to_vec();
                         if output_q.len() >= MAX_OUTPUT_Q {
-                            // Ring buffer overflow: drop the oldest packet.
-                            // Quinn will retransmit; this is better than starvation.
                             output_q.pop_front();
-                            debug!("bridge: output_q overflow, dropped oldest QUIC packet");
+                            warn!(q_len = MAX_OUTPUT_Q, "bridge: output_q overflow, dropped oldest");
                         }
                         output_q.push_back(data);
-                        tracing::trace!(q_len = output_q.len(), "quic→output_q");
+                        info!(q_len = output_q.len(), bytes = n, "bridge: ← quinn QUIC packet queued for next DNS poll");
                     }
                 }
             }
