@@ -126,34 +126,58 @@ fn build_server_config(
 
     // ── Idle / keepalive ──────────────────────────────────────────────────────
     transport.max_idle_timeout(Some(Duration::from_secs(300).try_into()?));
-    transport.keep_alive_interval(Some(Duration::from_millis(400)));
+    // Use a longer keepalive to avoid flooding the ISP resolver with server-side
+    // pings (client keepalives already keep the path alive every ~100ms).
+    transport.keep_alive_interval(Some(Duration::from_secs(2)));
 
     // ── Congestion control ─────────────────────────────────────────────────
     // BBR; C code uses cwin=UINT64_MAX (no CC) which quinn doesn't expose.
     transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
 
     // ── Window sizes ─────────────────────────────────────────────────────────
-    // 512 KB: not the bottleneck for DNS tunnel bandwidth, but won't cause
-    // QUIC to buffer huge amounts of data above what DNS can deliver.
     transport.send_window(512 * 1024);
     transport.receive_window(quinn::VarInt::from_u32(512 * 1024));
     transport.stream_receive_window(quinn::VarInt::from_u32(256 * 1024));
 
-    // ── MTU: same formula as C code: mtu = (240 - domain_len) / 1.6 ────────
-    // Caps post-handshake QUIC packets to fit in one DNS query. QUIC Initial
-    // packets are still 1200 bytes (RFC 9000 requirement) but data packets
-    // will be small after PMTUD settles to this upper bound.
-    let mtu = ((240.0 - domain.len() as f64) / 1.6) as u16;
-    let mtu = mtu.max(60).min(1200);
+    // ── MTU: sized so every DNS response fits in 512 bytes ────────────────
+    //
+    // Many ISP recursive resolvers (especially in Africa/Asia) only relay DNS
+    // UDP responses up to 512 bytes back to clients — the old pre-EDNS limit.
+    // If a DNS TXT response carrying a QUIC packet exceeds 512 bytes, the
+    // resolver silently drops or truncates it, killing the handshake.
+    //
+    // Budget breakdown for a 512-byte DNS response:
+    //   12  DNS header
+    //  ~36  question section overhead (QTYPE + QCLASS + root label)
+    //  ~11  EDNS OPT RR
+    //  ~14  answer RR overhead (compressed name ptr + type/class/TTL/rdlen)
+    //  = ~73 bytes fixed overhead, leaving ~439 for QNAME wire + QUIC payload.
+    //
+    // The QNAME wire length ≈ domain.len() + 2*label_overhead.
+    // We use a conservative budget of 200 bytes for QUIC payload.
+    //
+    // This initial_mtu forces quinn to use small packets from the very first
+    // flight — INCLUDING the ServerHello and certificate — so every DNS
+    // response the server produces is safely under 512 bytes.
+    let isp_response_budget: u16 = 512;
+    let dns_overhead: u16 = 73 + domain.len() as u16 + 40; // conservative
+    let max_quic_in_response = isp_response_budget.saturating_sub(dns_overhead);
+    // Clamp: quinn requires initial_mtu >= 1200 is NOT true — it supports lower
+    // for tunneling. Minimum usable for QUIC is ~60 bytes.
+    let tunnel_mtu = max_quic_in_response.max(60).min(500);
+
+    transport.initial_mtu(tunnel_mtu);
+
     let mut mtu_cfg = quinn::MtuDiscoveryConfig::default();
-    mtu_cfg.upper_bound(mtu);
+    mtu_cfg.upper_bound(tunnel_mtu);
     transport.mtu_discovery_config(Some(mtu_cfg));
 
     // ── Multiplexing ─────────────────────────────────────────────────────────
     transport.max_concurrent_bidi_streams(quinn::VarInt::from_u32(256));
 
-    // ── Initial RTT estimate ────────────────────────────────────────────────
-    transport.initial_rtt(Duration::from_millis(400));
+    // ── Initial RTT estimate ─────────────────────────────────────────────────
+    // Set a generous initial RTT — DNS-over-ISP-resolver can be 400-800 ms.
+    transport.initial_rtt(Duration::from_millis(800));
 
     config.transport_config(Arc::new(transport));
 
@@ -188,6 +212,8 @@ use std::collections::HashMap;
 struct FragState {
     chunks: HashMap<u8, Vec<u8>>,
     total: u8,
+    /// Instant when this fragment group was first seen — used for GC.
+    created_at: std::time::Instant,
 }
 
 /// Bridge task: DNS UDP socket ↔ quinn loopback socket.
@@ -219,8 +245,11 @@ async fn run_bridge(
 
     // Outbound QUIC packets from quinn, waiting for a DNS query to carry them.
     // Bounded to avoid unbounded growth; oldest packets dropped if full.
+    // Larger queue helps with bursts of QUIC handshake packets.
     let mut output_q: VecDeque<Vec<u8>> = VecDeque::new();
-    const MAX_OUTPUT_Q: usize = 16;
+    const MAX_OUTPUT_Q: usize = 64;
+    /// Stale fragment reassembly entries older than this are purged.
+    const FRAG_TTL_SECS: u64 = 10;
 
     loop {
         select! {
@@ -245,6 +274,15 @@ async fn run_bridge(
                                 }
                             }
                             Ok((frag_id, seq, total, chunk)) => {
+                                // ── Stale fragment GC ─────────────────────────────
+                                // Clean up partial assemblies older than FRAG_TTL_SECS.
+                                // Without this, a lost fragment causes permanent map growth
+                                // and also prevents clean retransmission from the client.
+                                let now = std::time::Instant::now();
+                                reassembly.retain(|_, st| {
+                                    now.duration_since(st.created_at).as_secs() < FRAG_TTL_SECS
+                                });
+
                                 // ── Step 1: inject incoming QUIC data into quinn ──
                                 if !chunk.is_empty() {
                                     if total == 1 {
@@ -257,6 +295,7 @@ async fn run_bridge(
                                         let entry = reassembly.entry(frag_id).or_insert_with(|| FragState {
                                             chunks: HashMap::new(),
                                             total,
+                                            created_at: std::time::Instant::now(),
                                         });
                                         entry.chunks.insert(seq, chunk);
 

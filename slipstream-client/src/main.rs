@@ -99,6 +99,26 @@ fn build_client_config(accept_insecure: bool, keep_alive_ms: u64, domain: &str) 
     // look like loss to NewReno, so BBR is a much better fit.
     transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
 
+    // ── MTU: sized so every DNS response fits in 512 bytes ──────────────
+    // Many ISP recursive resolvers only relay DNS UDP responses up to 512 bytes
+    // back to clients (the old pre-EDNS limit). A QUIC packet larger than
+    // ~200 bytes, once wrapped in a DNS TXT response, can exceed 512 bytes
+    // and get silently dropped by the resolver, killing the handshake.
+    //
+    // `initial_mtu` sets the packet size for ALL QUIC flights, including the
+    // Initial/Handshake packet number spaces (ServerHello, cert, etc.).
+    // `upper_bound` prevents MTU discovery from probing above this value.
+    let isp_response_budget: u16 = 512;
+    let dns_overhead: u16 = 73 + domain.len() as u16 + 40; // conservative
+    let max_quic_in_response = isp_response_budget.saturating_sub(dns_overhead);
+    let tunnel_mtu = max_quic_in_response.max(60).min(500);
+
+    transport.initial_mtu(tunnel_mtu);
+
+    let mut mtu_cfg = quinn::MtuDiscoveryConfig::default();
+    mtu_cfg.upper_bound(tunnel_mtu);
+    transport.mtu_discovery_config(Some(mtu_cfg));
+
     // ── Window sizes ─────────────────────────────────────────────────────────
     // 512 KB is plenty for a DNS tunnel at ~5-50 KB/s effective bandwidth.
     // Larger windows cause QUIC to buffer hundreds of KB locally and report
@@ -107,23 +127,13 @@ fn build_client_config(accept_insecure: bool, keep_alive_ms: u64, domain: &str) 
     transport.receive_window(quinn::VarInt::from_u32(512 * 1024));        // 512 KB
     transport.stream_receive_window(quinn::VarInt::from_u32(256 * 1024)); // 256 KB per stream
 
-    // ── MTU: match what C code does: mtu = (240 - domain_len) / 1.6 ──────────
-    // This tells quinn to cap outgoing QUIC packets to the size that fits
-    // in one DNS query (post-handshake). QUIC Initial packets are still padded
-    // to 1200 bytes per RFC 9000, but all data packets will be small.
-    // We use MtuDiscoveryConfig upper_bound instead of None so quinn actually
-    // learns and uses this MTU after the config probes settle.
-    let mtu = ((240.0 - domain.len() as f64) / 1.6) as u16;
-    let mtu = mtu.max(60).min(1200); // safety bounds
-    let mut mtu_cfg = quinn::MtuDiscoveryConfig::default();
-    mtu_cfg.upper_bound(mtu);
-    transport.mtu_discovery_config(Some(mtu_cfg));
-
     // ── Multiplexing ─────────────────────────────────────────────────────────
     transport.max_concurrent_bidi_streams(quinn::VarInt::from_u32(256));
 
     // ── Initial RTT estimate ─────────────────────────────────────────────────
-    transport.initial_rtt(Duration::from_millis(400));
+    // DNS-over-ISP-resolver can be 400-800 ms; set a realistic starting RTT
+    // so quinn's loss detection and retransmit timers are not too aggressive.
+    transport.initial_rtt(Duration::from_millis(800));
 
     config.transport_config(Arc::new(transport));
 
@@ -259,9 +269,10 @@ async fn run_keepalive(
     domain: String,
     mut shutdown: tokio::sync::broadcast::Receiver<()>,
 ) {
-    // 20ms keeps ~20 slots outstanding at 400ms RTT — enough for good throughput.
-    // If the resolver rate-limits us, we back off automatically via error handling.
-    let mut tick = interval(Duration::from_millis(20));
+    // 100ms gives ~10 outstanding queries at 1s RTT — enough to keep data
+    // flowing while not flooding an ISP resolver that rate-limits by source IP.
+    // (Old value of 20ms = 50 q/s was triggering rate limiting on some ISPs.)
+    let mut tick = interval(Duration::from_millis(100));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
